@@ -1,0 +1,24 @@
+[package]
+name = "sigmacode-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless CLI for SigmaCode"
+
+[[bin]]
+name = "sigmacode-headless"
+path = "src/main.rs"
+
+[dependencies]
+sigmacode-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+dirs.workspace = true
+dotenvy.workspace = true

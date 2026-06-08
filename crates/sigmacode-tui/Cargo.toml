@@ -1,0 +1,27 @@
+[package]
+name = "sigmacode-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal UI for SigmaCode"
+
+[[bin]]
+name = "sigmacode"
+path = "src/main.rs"
+
+[dependencies]
+sigmacode-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossterm = "0.28"
+ratatui = "0.29"
+serde_json.workspace = true
+futures.workspace = true
+dirs.workspace = true
+dotenvy.workspace = true

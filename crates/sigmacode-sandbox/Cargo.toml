@@ -1,0 +1,13 @@
+[package]
+name = "sigmacode-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OS-level sandboxing for SigmaCode"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true

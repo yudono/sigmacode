@@ -1,0 +1,15 @@
+[package]
+name = "sigmacode-retrieval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Context retrieval engine for SigmaCode"
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
