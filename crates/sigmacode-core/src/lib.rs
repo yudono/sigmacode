@@ -11,6 +11,7 @@ pub mod types;
 mod tests;
 
 pub use agent::engine::Agent;
+pub use agent::orchestrator::Orchestrator;
 pub use agent::planner::Planner;
 pub use context::ContextBuilder;
 pub use error::{Result, SigmaError};

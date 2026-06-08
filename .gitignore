@@ -4,3 +4,8 @@
 *.swo
 *~
 .DS_Store
+node_modules/
+portfolio/
+package.json
+package-lock.json
+src/

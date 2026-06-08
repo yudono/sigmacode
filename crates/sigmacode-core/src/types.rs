@@ -278,6 +278,18 @@ pub enum AgentEvent {
     DiffGenerated { file_path: String, old_content: String, new_content: String },
     Thinking { content: String },
     Compacting { message: String },
+    // Architecture events
+    AnalysisComplete { goals: Vec<String>, constraints: Vec<String>, success_criteria: Vec<String> },
+    PlanValidated { issues: Vec<String> },
+    VerificationStarted { step: String },
+    VerificationPassed { step: String },
+    VerificationFailed { step: String, errors: Vec<String> },
+    Criticking { errors: Vec<String> },
+    CriticResult { root_cause: String, fix: String },
+    Replanning { reason: String, attempt: u32 },
+    Reviewing,
+    ReviewComplete { score: u32, issues_count: usize },
+    Finalizing,
 }
 
 // ── Provider Config ──
@@ -306,4 +318,85 @@ pub enum ProviderConfig {
         base_url: Option<String>,
         model: String,
     },
+}
+
+// ── Architecture Types ──
+
+#[derive(Debug, Clone)]
+pub struct TaskAnalysis {
+    pub intent: String,
+    pub goals: Vec<String>,
+    pub constraints: Vec<String>,
+    pub success_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanStep {
+    pub id: usize,
+    pub description: String,
+    pub tool: String,
+    pub args: serde_json::Value,
+    pub depends_on: Vec<usize>,
+    pub risk_level: RiskLevel,
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionPlan {
+    pub steps: Vec<PlanStep>,
+    pub total_risk: RiskLevel,
+    pub estimated_complexity: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerificationResult {
+    pub passed: bool,
+    pub step: String,
+    pub errors: Vec<String>,
+    pub output: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CriticResult {
+    pub root_cause: String,
+    pub error_class: String,
+    pub fix_recommendation: String,
+    pub affected_steps: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewResult {
+    pub issues: Vec<ReviewIssue>,
+    pub score: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewIssue {
+    pub severity: ReviewSeverity,
+    pub category: String,
+    pub file: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReviewSeverity {
+    Critical,
+    Warning,
+    Info,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionMemory {
+    pub actions: Vec<String>,
+    pub files_modified: Vec<String>,
+    pub errors_encountered: Vec<String>,
+    pub patterns_learned: Vec<String>,
 }

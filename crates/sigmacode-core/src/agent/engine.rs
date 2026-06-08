@@ -807,7 +807,7 @@ impl Agent {
     }
 }
 
-fn parse_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
+pub fn parse_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
     let mut tool_calls = Vec::new();
 
     if let Some(start) = text.find("```tool_call") {
