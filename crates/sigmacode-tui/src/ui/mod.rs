@@ -2,6 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use crate::app::{App, AppState, MessageRole, Tab};
+use crate::highlight;
 
 const BRAND: Color = Color::Rgb(200, 160, 80);
 const DIM: Color = Color::Rgb(100, 100, 100);
@@ -64,12 +65,8 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
                 ]));
             }
             MessageRole::Assistant => {
-                for line in msg.content.lines() {
-                    lines.push(Line::from(Span::styled(
-                        line.to_string(),
-                        Style::default().fg(Color::Rgb(200, 200, 200)),
-                    )));
-                }
+                let highlighted = highlight::render_message_with_highlights(&msg.content);
+                lines.extend(highlighted);
             }
             MessageRole::Tool => {
                 let content = msg.content.clone();
@@ -203,8 +200,10 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    let total_lines = lines.len() as u16;
+    let area_height = area.height;
     let effective_scroll = if app.follow {
-        u16::MAX
+        total_lines.saturating_sub(area_height)
     } else {
         app.scroll_offset as u16
     };

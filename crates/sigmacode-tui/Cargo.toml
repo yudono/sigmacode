@@ -26,3 +26,4 @@ futures.workspace = true
 dirs.workspace = true
 serde_yaml.workspace = true
 serde.workspace = true
+syntect.workspace = true
