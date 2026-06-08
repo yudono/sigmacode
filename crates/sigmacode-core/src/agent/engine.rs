@@ -389,18 +389,11 @@ fn parse_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
     let mut tool_calls = Vec::new();
 
     if let Some(start) = text.find("```tool_call") {
-        let content_start = start + 12; // "```tool_call" is 12 chars
+        let content_start = start + 12;
         if let Some(end) = text[content_start..].find("```") {
             let json_str = text[content_start..content_start + end].trim();
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(tool_name) = parsed["tool"].as_str() {
-                    let args = parsed.get("args").cloned().unwrap_or_default();
-                    tool_calls.push(ToolCall {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        name: tool_name.to_string(),
-                        arguments: args,
-                    });
-                }
+            if let Some(tc) = parse_tool_json(json_str) {
+                tool_calls.push(tc);
             }
         }
     }
@@ -410,21 +403,39 @@ fn parse_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
             let content_start = start + 7;
             if let Some(end) = text[content_start..].find("```") {
                 let json_str = text[content_start..content_start + end].trim();
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    if let Some(tool_name) = parsed["tool"].as_str() {
-                        let args = parsed.get("args").cloned().unwrap_or_default();
-                        tool_calls.push(ToolCall {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            name: tool_name.to_string(),
-                            arguments: args,
-                        });
-                    }
+                if let Some(tc) = parse_tool_json(json_str) {
+                    tool_calls.push(tc);
                 }
             }
         }
     }
 
+    // Also detect raw JSON tool calls without markdown wrappers
+    // e.g. {"tool": "write_file", "args": {"path": "...", ...}}
+    if tool_calls.is_empty() {
+        let trimmed = text.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            if let Some(tc) = parse_tool_json(trimmed) {
+                tool_calls.push(tc);
+            }
+        }
+    }
+
     tool_calls
+}
+
+fn parse_tool_json(json_str: &str) -> Option<ToolCall> {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+        if let Some(tool_name) = parsed["tool"].as_str() {
+            let args = parsed.get("args").cloned().unwrap_or_default();
+            return Some(ToolCall {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: tool_name.to_string(),
+                arguments: args,
+            });
+        }
+    }
+    None
 }
 
 fn detect_tool_type(task: &str) -> String {

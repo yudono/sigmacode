@@ -899,7 +899,14 @@ Use these naturally - the agent decides which tool to use based on your task."#
 
                 // If we're inside a tool_call block, just buffer and wait for it to complete.
                 // ToolCallStarted already displays the tool call, so we discard the raw block.
-                if self.pending_tool_call.contains("```tool_call") || self.pending_tool_call.contains("```json") {
+                let pt = &self.pending_tool_call;
+                let in_marker_block = pt.contains("```tool_call") || pt.contains("```json");
+                // Also detect raw JSON tool calls without markdown wrappers: {"tool": "...", "args": ...}
+                let looks_like_raw_tool_json = pt.trim_start().starts_with('{')
+                    && pt.contains("\"tool\":")
+                    && pt.len() > 10;
+
+                if in_marker_block {
                     // Find the closing ``` to know when the block is done
                     let open_marker = if let Some(p) = self.pending_tool_call.find("```tool_call") {
                         p + 12 // "```tool_call" is 12 chars
@@ -914,6 +921,19 @@ Use these naturally - the agent decides which tool to use based on your task."#
                         self.pending_tool_call.clear();
                     }
                     // Don't display anything while inside a tool_call block
+                    return;
+                }
+
+                // Handle raw JSON tool calls (no markdown wrappers)
+                if looks_like_raw_tool_json {
+                    // Try to detect if the JSON is complete by checking for balanced braces
+                    let trimmed = self.pending_tool_call.trim();
+                    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                        // Looks complete — discard it (engine will parse it)
+                        self.pending_tool_call.clear();
+                        return;
+                    }
+                    // Still incomplete — buffer and don't display
                     return;
                 }
 
