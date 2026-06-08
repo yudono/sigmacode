@@ -3,11 +3,15 @@ name = "sigmacode-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Headless CLI for SigmaCode"
+description = "Headless CLI and Server for SigmaCode"
 
 [[bin]]
 name = "sigmacode-headless"
 path = "src/main.rs"
+
+[[bin]]
+name = "sigmacode-server"
+path = "src/server.rs"
 
 [dependencies]
 sigmacode-core.workspace = true
@@ -23,3 +27,6 @@ futures.workspace = true
 dirs.workspace = true
 serde_yaml.workspace = true
 serde.workspace = true
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower = "0.4"

@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  sigmacode-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    ports:
+      - "3847:3847"
+    environment:
+      - SIGMACODE_PORT=3847
+      - SIGMACODE_API_KEY=${SIGMACODE_API_KEY:-sk-sr80smbaiismtvgf52xgfthezp2qy4c9s7m7vqdsih2wnij5}
+      - SIGMACODE_BASE_URL=${SIGMACODE_BASE_URL:-https://api.xiaomimimo.com/v1}
+      - SIGMACODE_MODEL=${SIGMACODE_MODEL:-mimo-v2.5}
+    volumes:
+      - workspace:/workspace
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3847/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  workspace:
