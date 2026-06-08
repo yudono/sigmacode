@@ -901,9 +901,7 @@ Use these naturally - the agent decides which tool to use based on your task."#
                 let pt = &self.pending_tool_call;
                 let in_marker_block = pt.contains("```tool_call") || pt.contains("```json");
                 // Also detect raw JSON tool calls without markdown wrappers: {"tool": "...", "args": ...}
-                let looks_like_raw_tool_json = pt.trim_start().starts_with('{')
-                    && pt.contains("\"tool\":")
-                    && pt.len() > 10;
+                let looks_like_raw_tool_json = pt.contains("\"tool\":") && pt.contains("\"args\"") && pt.len() > 20;
 
                 if in_marker_block {
                     // Find the closing ``` to know when the block is done
@@ -927,10 +925,14 @@ Use these naturally - the agent decides which tool to use based on your task."#
                 if looks_like_raw_tool_json {
                     // Try to detect if the JSON is complete by checking for balanced braces
                     let trimmed = self.pending_tool_call.trim();
-                    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-                        // Looks complete — discard it (engine will parse it)
-                        self.pending_tool_call.clear();
-                        return;
+                    // Find the last { ... } block that looks like a tool call
+                    if let Some(start) = trimmed.rfind("{\"tool\":") {
+                        let json_part = &trimmed[start..];
+                        if json_part.ends_with('}') {
+                            // Looks complete — discard it (engine will parse it)
+                            self.pending_tool_call.clear();
+                            return;
+                        }
                     }
                     // Still incomplete — buffer and don't display
                     return;
@@ -951,8 +953,7 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     || p.ends_with("```json")
                     || p.ends_with("```jso")
                     || p.ends_with("```js")
-                    || p.ends_with("```j")
-                    || p.ends_with("```\n");
+                    || p.ends_with("```j");
 
                 if might_be_marker {
                     // Might be entering a tool_call block, buffer and wait for more tokens
