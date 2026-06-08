@@ -23,6 +23,9 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::sink)
         .init();
 
+    let _ = log::set_logger(&NULL_LOGGER);
+    log::set_max_level(log::LevelFilter::Off);
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -46,6 +49,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+static NULL_LOGGER: NullLogger = NullLogger;
+
+struct NullLogger;
+
+impl log::Log for NullLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        false
+    }
+    fn log(&self, _record: &log::Record) {}
+    fn flush(&self) {}
 }
 
 async fn run_app(
