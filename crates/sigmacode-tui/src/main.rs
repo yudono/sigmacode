@@ -12,34 +12,8 @@ use ratatui::prelude::*;
 
 use app::App;
 
-fn load_dotenv() {
-    // Try current directory first
-    if dotenvy::dotenv().is_ok() {
-        return;
-    }
-    // Try ~/.config/sigmacode/.env
-    if let Some(home) = dirs::home_dir() {
-        let config_path = home.join(".config").join("sigmacode").join(".env");
-        if config_path.exists() {
-            let _ = dotenvy::from_path(&config_path);
-            return;
-        }
-    }
-    // Try binary's directory
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let env_path = dir.join(".env");
-            if env_path.exists() {
-                let _ = dotenvy::from_path(&env_path);
-            }
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    load_dotenv();
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

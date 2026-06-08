@@ -9,8 +9,6 @@ use sigmacode_core::WorkingMemory;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -20,8 +18,6 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    let config = load_config()?;
-
     let task = if args.len() > 1 {
         args[1..].join(" ")
     } else {
@@ -30,9 +26,11 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     };
 
+    let (provider_config, model, api_key, base_url) = load_sigma_config()?;
+
     eprintln!("SigmaCode (headless) - Task: {}", task);
 
-    let provider = create_provider(&config.provider);
+    let provider = create_provider(&provider_config);
     let tools = ToolRouter::default();
     let workspace = std::env::current_dir()?;
     let project_name = workspace
@@ -52,9 +50,9 @@ async fn main() -> anyhow::Result<()> {
         working_memory: WorkingMemory::new(10_000),
         workspace,
         config: AgentConfig {
-            model: config.model.clone(),
-            api_key: config.api_key.clone(),
-            base_url: config.base_url.clone(),
+            model,
+            api_key,
+            base_url: base_url.unwrap_or_default(),
             max_tokens: 4096,
             max_iterations: 50,
             context_window: 128_000,
@@ -74,51 +72,58 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct AppConfig {
-    provider: ProviderConfig,
+#[derive(serde::Deserialize)]
+struct SigmaConfig {
+    provider: String,
     model: String,
+    #[serde(default)]
     api_key: String,
-    base_url: String,
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
-fn load_config() -> anyhow::Result<AppConfig> {
-    let api_key = std::env::var("SIGMACODE_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .unwrap_or_default();
+fn load_sigma_config() -> anyhow::Result<(ProviderConfig, String, String, Option<String>)> {
+    let config_path = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+        .join(".sigma")
+        .join("config.yml");
 
-    let base_url = std::env::var("SIGMACODE_BASE_URL")
-        .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    if !config_path.exists() {
+        anyhow::bail!(
+            "Config not found at ~/.sigma/config.yml\nRun `sigmacode` (TUI) first to complete setup."
+        );
+    }
 
-    let model = std::env::var("SIGMACODE_MODEL")
-        .or_else(|_| std::env::var("OPENAI_MODEL"))
-        .unwrap_or_else(|_| "gpt-4o".into());
+    let content = std::fs::read_to_string(&config_path)?;
+    let cfg: SigmaConfig = serde_yaml::from_str(&content)?;
 
-    let provider_type = std::env::var("SIGMACODE_PROVIDER").unwrap_or_else(|_| "openai".into());
-
-    let provider = match provider_type.as_str() {
-        "anthropic" => {
-            let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-            ProviderConfig::Anthropic {
-                api_key: key,
-                model: model.clone(),
-            }
-        }
+    let provider = match cfg.provider.as_str() {
+        "anthropic" => ProviderConfig::Anthropic {
+            api_key: cfg.api_key.clone(),
+            model: cfg.model.clone(),
+        },
         "ollama" => ProviderConfig::Ollama {
-            base_url: Some(base_url.clone()),
-            model: model.clone(),
+            base_url: Some(
+                cfg.base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://localhost:11434".into()),
+            ),
+            model: cfg.model.clone(),
+        },
+        "gemini" => ProviderConfig::Gemini {
+            api_key: cfg.api_key.clone(),
+            model: cfg.model.clone(),
         },
         _ => ProviderConfig::OpenAi {
-            api_key: api_key.clone(),
-            base_url: Some(base_url.clone()),
-            model: model.clone(),
+            api_key: cfg.api_key.clone(),
+            base_url: Some(
+                cfg.base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            ),
+            model: cfg.model.clone(),
         },
     };
 
-    Ok(AppConfig {
-        provider,
-        model,
-        api_key,
-        base_url,
-    })
+    Ok((provider, cfg.model, cfg.api_key, cfg.base_url))
 }

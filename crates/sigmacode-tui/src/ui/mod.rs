@@ -306,19 +306,51 @@ fn render_setup(f: &mut Frame, app: &App, area: Rect) {
             )));
         }
         SetupStep::BaseUrl => {
+            let default_url = match app.setup.provider_choice.as_str() {
+                "ollama" => "http://localhost:11434",
+                "openai" => "https://api.openai.com/v1",
+                "anthropic" => "https://api.anthropic.com",
+                "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai",
+                _ => "",
+            };
+            let provider_display = match app.setup.provider_choice.as_str() {
+                "openai" => "OpenAI".to_string(),
+                "anthropic" => "Anthropic".to_string(),
+                "ollama" => "Ollama".to_string(),
+                "gemini" => "Gemini".to_string(),
+                other => other.to_string(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  Provider: ", Style::default().fg(DIM)),
+                Span::styled(
+                    provider_display,
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "  Enter Ollama base URL (or press Enter for default):",
+                "  Enter base URL (or press Enter for default):",
                 Style::default().fg(Color::White),
             )));
+            if !default_url.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Default: {}", default_url),
+                    Style::default().fg(DIM),
+                )));
+            }
             lines.push(Line::from(Span::styled(
-                "  Default: http://localhost:11434",
+                "  Use this for custom/proxy endpoints",
                 Style::default().fg(DIM),
             )));
-        }
-        SetupStep::Model => {
+            lines.push(Line::from(""));
+            let input_display = if app.input.is_empty() {
+                "  (press Enter to skip)".to_string()
+            } else {
+                format!("  {}", app.input)
+            };
             lines.push(Line::from(Span::styled(
-                "  Enter model name:",
-                Style::default().fg(Color::White),
+                input_display,
+                Style::default().fg(Color::Rgb(200, 200, 200)),
             )));
         }
         SetupStep::Done => {}
@@ -397,7 +429,7 @@ fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" · ", Style::default().fg(DIM)),
-        Span::styled(&app.config.model, Style::default().fg(DIM)),
+        Span::styled(&app.sigma_config.model, Style::default().fg(DIM)),
         Span::styled(" · ", Style::default().fg(DIM)),
         Span::styled(&app.token_display, Style::default().fg(DIM)),
         Span::styled(

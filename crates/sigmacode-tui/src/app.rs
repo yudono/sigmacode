@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use sigmacode_core::llm::create_provider;
 use sigmacode_core::tools::ToolRouter;
 use sigmacode_core::Agent;
@@ -9,6 +10,84 @@ use sigmacode_core::ProviderConfig;
 use sigmacode_core::WorkingMemory;
 use tokio::sync::mpsc;
 
+const CONFIG_DIR: &str = ".sigma";
+const CONFIG_FILE: &str = "config.yml";
+
+// ── YAML Config ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigmaConfig {
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+impl Default for SigmaConfig {
+    fn default() -> Self {
+        Self {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            api_key: String::new(),
+            base_url: None,
+        }
+    }
+}
+
+fn config_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(CONFIG_DIR))
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|d| d.join(CONFIG_FILE))
+}
+
+fn load_sigma_config() -> SigmaConfig {
+    if let Some(path) = config_path() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(cfg) = serde_yaml::from_str::<SigmaConfig>(&content) {
+                return cfg;
+            }
+        }
+    }
+    SigmaConfig::default()
+}
+
+fn save_sigma_config(cfg: &SigmaConfig) -> anyhow::Result<()> {
+    let dir = config_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    std::fs::create_dir_all(&dir)?;
+    let content = serde_yaml::to_string(cfg)?;
+    std::fs::write(dir.join(CONFIG_FILE), content)?;
+    Ok(())
+}
+
+fn sigma_config_to_provider_config(cfg: &SigmaConfig) -> ProviderConfig {
+    let base = cfg.base_url.clone().unwrap_or_default();
+    match cfg.provider.as_str() {
+        "anthropic" => ProviderConfig::Anthropic {
+            api_key: cfg.api_key.clone(),
+            model: cfg.model.clone(),
+        },
+        "ollama" => ProviderConfig::Ollama {
+            base_url: Some(if base.is_empty() { "http://localhost:11434".into() } else { base }),
+            model: cfg.model.clone(),
+        },
+        "gemini" => ProviderConfig::Gemini {
+            api_key: cfg.api_key.clone(),
+            model: cfg.model.clone(),
+        },
+        _ => ProviderConfig::OpenAi {
+            api_key: cfg.api_key.clone(),
+            base_url: Some(if base.is_empty() { "https://api.openai.com/v1".into() } else { base }),
+            model: cfg.model.clone(),
+        },
+    }
+}
+
+// ── App ──
+
 pub struct App {
     pub state: AppState,
     pub input: String,
@@ -17,7 +96,8 @@ pub struct App {
     pub event_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
     pub event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     pub should_quit: bool,
-    pub config: AppConfig,
+    pub sigma_config: SigmaConfig,
+    pub provider_config: ProviderConfig,
     pub current_tab: Tab,
     pub logs: Vec<String>,
     pub scroll_offset: usize,
@@ -85,6 +165,7 @@ pub struct PermissionRequest {
     pub allow_always: bool,
 }
 
+#[allow(dead_code)]
 pub struct AppConfig {
     pub provider: ProviderConfig,
     pub model: String,
@@ -106,8 +187,6 @@ pub enum SetupStep {
     Provider,
     ApiKey,
     BaseUrl,
-    #[allow(dead_code)]
-    Model,
     Done,
 }
 
@@ -125,11 +204,9 @@ impl Default for SetupState {
 
 impl App {
     pub async fn new() -> anyhow::Result<Self> {
-        // Load config first
-        let config = load_config()?;
-
-        // Determine if setup is needed
-        let needs_setup = needs_setup_wizard(&config);
+        let sigma_config = load_sigma_config();
+        let needs_setup = needs_setup_wizard(&sigma_config);
+        let provider_config = sigma_config_to_provider_config(&sigma_config);
 
         Ok(Self {
             state: if needs_setup {
@@ -143,7 +220,8 @@ impl App {
             event_rx: None,
             event_tx: None,
             should_quit: false,
-            config,
+            sigma_config,
+            provider_config,
             current_tab: Tab::Chat,
             logs: Vec::new(),
             scroll_offset: 0,
@@ -251,6 +329,7 @@ impl App {
                         "3" | "ollama" => {
                             self.setup.provider_choice = "ollama".into();
                             self.setup.model = "llama3".into();
+                            self.setup.base_url = "http://localhost:11434".into();
                             self.setup.step = SetupStep::BaseUrl;
                         }
                         "4" | "gemini" => {
@@ -270,33 +349,20 @@ impl App {
                 SetupStep::ApiKey => {
                     self.setup.api_key = self.input.trim().to_string();
                     self.input.clear();
-                    self.setup.step = SetupStep::Done;
-                    self.finish_setup();
+                    // Ask for custom base_url (optional)
+                    self.setup.step = SetupStep::BaseUrl;
                 }
                 SetupStep::BaseUrl => {
-                    self.setup.base_url = self.input.trim().to_string();
+                    let url = self.input.trim().to_string();
                     self.input.clear();
-                    self.setup.step = SetupStep::Done;
-                    self.finish_setup();
-                }
-                SetupStep::Model => {
-                    let m = self.input.trim().to_string();
-                    if !m.is_empty() {
-                        self.setup.model = m;
+                    if !url.is_empty() {
+                        self.setup.base_url = url;
                     }
-                    self.input.clear();
                     self.setup.step = SetupStep::Done;
                     self.finish_setup();
                 }
                 SetupStep::Done => {}
             },
-            crossterm::event::KeyCode::Esc => {
-                if self.setup.step == SetupStep::Provider {
-                    self.setup.step = SetupStep::Welcome;
-                } else if self.setup.step == SetupStep::ApiKey || self.setup.step == SetupStep::BaseUrl {
-                    self.setup.step = SetupStep::Provider;
-                }
-            }
             crossterm::event::KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -308,69 +374,25 @@ impl App {
     }
 
     fn finish_setup(&mut self) {
-        let provider = &self.setup.provider_choice;
-        let model = &self.setup.model;
-        let api_key = &self.setup.api_key;
-        let base_url = &self.setup.base_url;
+        self.sigma_config = SigmaConfig {
+            provider: self.setup.provider_choice.clone(),
+            model: self.setup.model.clone(),
+            api_key: self.setup.api_key.clone(),
+            base_url: if self.setup.base_url.is_empty() {
+                None
+            } else {
+                Some(self.setup.base_url.clone())
+            },
+        };
 
-        let mut env_content = format!(
-            "SIGMACODE_PROVIDER={}\nSIGMACODE_MODEL={}\n",
-            provider, model
-        );
-
-        match provider.as_str() {
-            "openai" => {
-                env_content.push_str(&format!("SIGMACODE_API_KEY={}\n", api_key));
-                if !base_url.is_empty() {
-                    env_content.push_str(&format!("SIGMACODE_BASE_URL={}\n", base_url));
-                }
-            }
-            "anthropic" => {
-                env_content.push_str(&format!("ANTHROPIC_API_KEY={}\n", api_key));
-            }
-            "ollama" => {
-                env_content.push_str(&format!(
-                    "SIGMACODE_BASE_URL={}\n",
-                    if base_url.is_empty() {
-                        "http://localhost:11434"
-                    } else {
-                        base_url
-                    }
-                ));
-            }
-            "gemini" => {
-                env_content.push_str(&format!("SIGMACODE_API_KEY={}\n", api_key));
-                env_content.push_str("SIGMACODE_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai\n");
-            }
-            _ => {}
-        }
-
-        // Save to ~/.config/sigmacode/.env (global)
-        if let Some(home) = dirs::home_dir() {
-            let config_dir = home.join(".config").join("sigmacode");
-            let _ = std::fs::create_dir_all(&config_dir);
-            let _ = std::fs::write(config_dir.join(".env"), &env_content);
-        }
-        // Also save to current directory
-        let _ = std::fs::write(".env", &env_content);
-
-        // Reload config
-        if let Some(home) = dirs::home_dir() {
-            let config_path = home.join(".config").join("sigmacode").join(".env");
-            if config_path.exists() {
-                let _ = dotenvy::from_path(&config_path);
-            }
-        }
-        let _ = dotenvy::dotenv();
-        if let Ok(new_config) = load_config() {
-            self.config = new_config;
-        }
+        let _ = save_sigma_config(&self.sigma_config);
+        self.provider_config = sigma_config_to_provider_config(&self.sigma_config);
 
         self.messages.push(ChatMessage {
             role: MessageRole::System,
             content: format!(
-                "Setup complete! Provider: {}, Model: {}\nConfig saved to .env",
-                self.setup.provider_choice, self.setup.model
+                "Setup complete!\nProvider: {}\nModel: {}\nConfig saved to ~/.sigma/config.yml",
+                self.sigma_config.provider, self.sigma_config.model
             ),
             diff: None,
         });
@@ -473,23 +495,12 @@ Keyboard shortcuts:
         if model.is_empty() {
             return format!(
                 "Current model: {}\n\nUsage: /models <model_name>\n\nExamples:\n  /models gpt-4o\n  /models claude-sonnet-4-20250514\n  /models mimo-v2.5",
-                self.config.model
+                self.sigma_config.model
             );
         }
-        self.config.model = model.to_string();
-        let env_content = format!(
-            "SIGMACODE_PROVIDER={}\nSIGMACODE_MODEL={}\nSIGMACODE_API_KEY={}\n",
-            self.provider_name(),
-            model,
-            self.api_key_masked()
-        );
-        // Save to ~/.config/sigmacode/.env
-        if let Some(home) = dirs::home_dir() {
-            let config_dir = home.join(".config").join("sigmacode");
-            let _ = std::fs::create_dir_all(&config_dir);
-            let _ = std::fs::write(config_dir.join(".env"), &env_content);
-        }
-        let _ = std::fs::write(".env", &env_content);
+        self.sigma_config.model = model.to_string();
+        self.provider_config = sigma_config_to_provider_config(&self.sigma_config);
+        let _ = save_sigma_config(&self.sigma_config);
         format!("Model switched to: {}", model)
     }
 
@@ -497,8 +508,8 @@ Keyboard shortcuts:
         format!(
             "Agent: sigmaCode v{}\nProvider: {}\nModel: {}\nWorkspace: {}",
             env!("CARGO_PKG_VERSION"),
-            self.provider_name(),
-            self.config.model,
+            self.sigma_config.provider,
+            self.sigma_config.model,
             std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "?".into())
@@ -521,47 +532,11 @@ Use these naturally - the agent decides which tool to use based on your task."#
 
     fn cmd_config(&self) -> String {
         format!(
-            "Provider: {}\nModel: {}\nBase URL: {}",
-            self.provider_name(),
-            self.config.model,
-            self.base_url_display()
+            "Provider: {}\nModel: {}\nBase URL: {}\nConfig: ~/.sigma/config.yml",
+            self.sigma_config.provider,
+            self.sigma_config.model,
+            self.sigma_config.base_url.as_deref().unwrap_or("(default)")
         )
-    }
-
-    fn provider_name(&self) -> &str {
-        match &self.config.provider {
-            ProviderConfig::OpenAi { .. } => "openai",
-            ProviderConfig::Anthropic { .. } => "anthropic",
-            ProviderConfig::Ollama { .. } => "ollama",
-            ProviderConfig::Gemini { .. } => "gemini",
-        }
-    }
-
-    fn api_key_masked(&self) -> String {
-        let key = match &self.config.provider {
-            ProviderConfig::OpenAi { api_key, .. } => api_key,
-            ProviderConfig::Anthropic { api_key, .. } => api_key,
-            ProviderConfig::Gemini { api_key, .. } => api_key,
-            _ => return String::new(),
-        };
-        if key.len() > 8 {
-            format!("{}...{}", &key[..4], &key[key.len() - 4..])
-        } else {
-            "****".into()
-        }
-    }
-
-    fn base_url_display(&self) -> &str {
-        match &self.config.provider {
-            ProviderConfig::OpenAi { base_url, .. } => {
-                base_url.as_deref().unwrap_or("https://api.openai.com/v1")
-            }
-            ProviderConfig::Ollama { base_url, .. } => {
-                base_url.as_deref().unwrap_or("http://localhost:11434")
-            }
-            ProviderConfig::Anthropic { .. } => "https://api.anthropic.com",
-            ProviderConfig::Gemini { .. } => "https://generativelanguage.googleapis.com",
-        }
     }
 
     // ── Agent ──
@@ -610,7 +585,7 @@ Use these naturally - the agent decides which tool to use based on your task."#
         self.event_tx = Some(event_tx.clone());
         self.scroll_offset = 0;
 
-        let provider = create_provider(&self.config.provider);
+        let provider = create_provider(&self.provider_config);
         let tools = ToolRouter::default();
         let workspace = std::env::current_dir().unwrap_or_default();
         let project_name = workspace
@@ -630,9 +605,9 @@ Use these naturally - the agent decides which tool to use based on your task."#
             working_memory: WorkingMemory::new(10_000),
             workspace,
             config: AgentConfig {
-                model: self.config.model.clone(),
-                api_key: String::new(),
-                base_url: String::new(),
+                model: self.sigma_config.model.clone(),
+                api_key: self.sigma_config.api_key.clone(),
+                base_url: self.sigma_config.base_url.clone().unwrap_or_default(),
                 max_tokens: 4096,
                 max_iterations: 50,
                 context_window: 128_000,
@@ -807,6 +782,18 @@ Use these naturally - the agent decides which tool to use based on your task."#
     }
 }
 
+// ── Helpers ──
+
+fn needs_setup_wizard(config: &SigmaConfig) -> bool {
+    if config.model.is_empty() {
+        return true;
+    }
+    match config.provider.as_str() {
+        "ollama" => false,
+        _ => config.api_key.is_empty() || config.api_key == "your-api-key-here",
+    }
+}
+
 fn build_diff_view(file_path: &str, old: &str, new: &str) -> DiffView {
     let old_lines: Vec<DiffLine> = old
         .lines()
@@ -929,71 +916,5 @@ fn format_tool_call(tool_name: &str, args: &serde_json::Value) -> String {
         _ => {
             format!("  {} {} {}", icon, tool_name, args)
         }
-    }
-}
-
-fn load_config() -> anyhow::Result<AppConfig> {
-    let api_key = std::env::var("SIGMACODE_API_KEY")
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .unwrap_or_default();
-
-    let base_url = std::env::var("SIGMACODE_BASE_URL")
-        .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.openai.com/v1".into());
-
-    let model = std::env::var("SIGMACODE_MODEL")
-        .or_else(|_| std::env::var("OPENAI_MODEL"))
-        .unwrap_or_default();
-
-    let provider_type = std::env::var("SIGMACODE_PROVIDER").unwrap_or_default();
-
-    let provider = match provider_type.as_str() {
-        "anthropic" => {
-            let key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-            ProviderConfig::Anthropic {
-                api_key: key,
-                model: model.clone(),
-            }
-        }
-        "ollama" => ProviderConfig::Ollama {
-            base_url: Some(base_url.clone()),
-            model: model.clone(),
-        },
-        "gemini" => {
-            let key = std::env::var("SIGMACODE_API_KEY").unwrap_or_default();
-            ProviderConfig::Gemini {
-                api_key: key,
-                model: model.clone(),
-            }
-        }
-        _ => ProviderConfig::OpenAi {
-            api_key,
-            base_url: Some(base_url.clone()),
-            model: model.clone(),
-        },
-    };
-
-    Ok(AppConfig { provider, model })
-}
-
-fn needs_setup_wizard(config: &AppConfig) -> bool {
-    // Always check if the actual config has valid values
-    // (don't short-circuit on .env existence — file might have empty values)
-
-    if config.model.is_empty() {
-        return true;
-    }
-
-    match &config.provider {
-        ProviderConfig::OpenAi { api_key, .. } => {
-            api_key.is_empty() || api_key == "your-api-key-here"
-        }
-        ProviderConfig::Anthropic { api_key, .. } => {
-            api_key.is_empty() || api_key == "your-api-key-here"
-        }
-        ProviderConfig::Gemini { api_key, .. } => {
-            api_key.is_empty() || api_key == "your-api-key-here"
-        }
-        ProviderConfig::Ollama { .. } => false,
     }
 }
