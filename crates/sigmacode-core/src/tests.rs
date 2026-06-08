@@ -218,7 +218,7 @@ mod context_tests {
         let state = make_state("test");
         let prompt = builder.build_system_prompt(&state);
 
-        assert!(prompt.contains("read files before editing"));
+        assert!(prompt.contains("Read existing files before editing"));
         assert!(prompt.contains("minimal, targeted changes"));
         assert!(prompt.contains("Never expose secrets"));
     }
