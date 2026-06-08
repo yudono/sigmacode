@@ -977,17 +977,13 @@ fn load_config() -> anyhow::Result<AppConfig> {
 }
 
 fn needs_setup_wizard(config: &AppConfig) -> bool {
-    // No .env file in current dir or config dir
-    let has_env_file = std::path::Path::new(".env").exists()
-        || dirs::home_dir()
-            .map(|h| h.join(".config").join("sigmacode").join(".env").exists())
-            .unwrap_or(false);
+    // Always check if the actual config has valid values
+    // (don't short-circuit on .env existence — file might have empty values)
 
-    if has_env_file {
-        return false;
+    if config.model.is_empty() {
+        return true;
     }
 
-    // Check if provider has a valid API key
     match &config.provider {
         ProviderConfig::OpenAi { api_key, .. } => {
             api_key.is_empty() || api_key == "your-api-key-here"
@@ -998,6 +994,6 @@ fn needs_setup_wizard(config: &AppConfig) -> bool {
         ProviderConfig::Gemini { api_key, .. } => {
             api_key.is_empty() || api_key == "your-api-key-here"
         }
-        ProviderConfig::Ollama { .. } => false, // Ollama doesn't need API key
+        ProviderConfig::Ollama { .. } => false,
     }
 }
