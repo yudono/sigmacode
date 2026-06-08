@@ -48,30 +48,52 @@ pub fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Parse message content and return lines with code blocks highlighted.
-/// Returns `(Vec<Line>, has_code_block)`.
+fn looks_like_jsx(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() { return false; }
+    if trimmed.starts_with('<') && !trimmed.starts_with("<!--") { return true; }
+    if trimmed.contains("className=") || trimmed.contains("onClick=") { return true; }
+    if trimmed.contains("import ") && trimmed.contains("from ") { return true; }
+    if trimmed.contains("export ") && (trimmed.contains("function ") || trimmed.contains("default ")) { return true; }
+    if trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("function ") { return true; }
+    if trimmed.starts_with("return (") || trimmed.starts_with("return(") { return true; }
+    if trimmed.contains("viewBox=") || trimmed.contains("fill=\"") { return true; }
+    false
+}
+
 pub fn render_message_with_highlights(content: &str) -> Vec<Line<'static>> {
     let mut result = Vec::new();
     let mut in_code_block = false;
+    let mut in_auto_code = false;
     let mut lang = String::new();
     let mut code_lines = Vec::new();
 
     for line in content.lines() {
         if line.starts_with("```") {
             if in_code_block {
-                // End of code block — flush highlighted code
                 let highlighted = highlight_code_block(&code_lines.join("\n"), &lang);
                 result.extend(highlighted);
                 code_lines.clear();
                 in_code_block = false;
             } else {
-                // Start of code block
                 lang = line.trim_start_matches('`').trim().to_string();
                 in_code_block = true;
             }
         } else if in_code_block {
             code_lines.push(line);
+        } else if looks_like_jsx(line) {
+            if !in_auto_code {
+                in_auto_code = true;
+                code_lines.clear();
+            }
+            code_lines.push(line);
         } else {
+            if in_auto_code && !code_lines.is_empty() {
+                let highlighted = highlight_code_block(&code_lines.join("\n"), "jsx");
+                result.extend(highlighted);
+                code_lines.clear();
+                in_auto_code = false;
+            }
             result.push(Line::from(Span::styled(
                 line.to_string(),
                 Style::default().fg(Color::Rgb(200, 200, 200)),
@@ -79,9 +101,12 @@ pub fn render_message_with_highlights(content: &str) -> Vec<Line<'static>> {
         }
     }
 
-    // If block wasn't closed, still render it
     if in_code_block && !code_lines.is_empty() {
         let highlighted = highlight_code_block(&code_lines.join("\n"), &lang);
+        result.extend(highlighted);
+    }
+    if in_auto_code && !code_lines.is_empty() {
+        let highlighted = highlight_code_block(&code_lines.join("\n"), "jsx");
         result.extend(highlighted);
     }
 

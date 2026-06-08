@@ -122,6 +122,7 @@ pub struct App {
     pub queue: VecDeque<String>,
     pub pending_tool_call: String,
     pub in_tool_result: bool,
+    pub in_tool_call_text: bool,
 }
 
 pub struct CmdChoice {
@@ -275,6 +276,7 @@ impl App {
             queue: VecDeque::new(),
             pending_tool_call: String::new(),
             in_tool_result: false,
+            in_tool_call_text: false,
         })
     }
 
@@ -934,6 +936,43 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     }
                 }
 
+                // Suppress tool_call text markers from MiMo API
+                if self.in_tool_call_text {
+                    if let Some(end) = self.pending_tool_call.find("}\n") {
+                        let after = &self.pending_tool_call[end + 2..];
+                        self.pending_tool_call = after.to_string();
+                        self.in_tool_call_text = false;
+                    } else if self.pending_tool_call.ends_with('}') {
+                        self.pending_tool_call.clear();
+                        self.in_tool_call_text = false;
+                        return;
+                    } else {
+                        self.pending_tool_call.clear();
+                        return;
+                    }
+                }
+
+                // Detect tool_call text blocks: "tool_call\n{...}" or just "tool_call"
+                {
+                    let pt = self.pending_tool_call.clone();
+                    if let Some(tc_pos) = pt.rfind("tool_call") {
+                        let after_tc = &pt[tc_pos + 9..];
+                        if after_tc.starts_with('\n') || after_tc.starts_with('{') || after_tc.is_empty() {
+                            let before = pt[..tc_pos].to_string();
+                            self.pending_tool_call = before;
+                            if after_tc.starts_with('{') {
+                                self.in_tool_call_text = true;
+                            } else if after_tc.starts_with('\n') {
+                                let rest = &after_tc[1..];
+                                self.pending_tool_call = rest.to_string();
+                            }
+                            if self.pending_tool_call.trim().is_empty() {
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 // If we're inside a tool_call block, just buffer and wait for it to complete.
                 let pt = &self.pending_tool_call;
                 let in_marker_block = pt.contains("```tool_call") || pt.contains("```json");
@@ -1202,6 +1241,7 @@ Use these naturally - the agent decides which tool to use based on your task."#
         let remaining = strip_tool_result_tags(&self.pending_tool_call.trim());
         self.pending_tool_call.clear();
         self.in_tool_result = false;
+        self.in_tool_call_text = false;
         if remaining.is_empty() {
             return;
         }
