@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use std::pin::Pin;
 
 use crate::error::Result;
@@ -205,37 +205,46 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let stream = response.bytes_stream();
-        let event_stream = futures::StreamExt::map(stream, |chunk| {
-            let chunk = chunk.map_err(|e| crate::error::SigmaError::Llm(e.to_string()))?;
+        let event_stream = futures::StreamExt::flat_map(stream, |chunk| {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    return futures::stream::iter(vec![Err(crate::error::SigmaError::Llm(e.to_string()))]).boxed()
+                }
+            };
             let text = String::from_utf8_lossy(&chunk).to_string();
+            let mut events = Vec::new();
 
             for line in text.lines() {
                 let line = line.trim();
-                if line.is_empty() || line == "data: [DONE]" {
+                if line.is_empty() {
                     continue;
+                }
+                if line == "data: [DONE]" {
+                    break;
                 }
                 if let Some(data) = line.strip_prefix("data: ") {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                         if let Some(delta) = json["choices"][0]["delta"].as_object() {
                             if let Some(content) = delta.get("content") {
                                 if let Some(text) = content.as_str() {
-                                    return Ok(LlmEvent::ContentDelta(text.to_string()));
+                                    events.push(Ok(LlmEvent::ContentDelta(text.to_string())));
                                 }
                             }
                         }
                         if let Some(usage) = json.get("usage") {
-                            return Ok(LlmEvent::Done {
+                            events.push(Ok(LlmEvent::Done {
                                 usage: TokenUsage {
                                     prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
                                     completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
                                     total_tokens: usage["total_tokens"].as_u64().unwrap_or(0) as u32,
                                 },
-                            });
+                            }));
                         }
                     }
                 }
             }
-            Ok(LlmEvent::ContentDelta(String::new()))
+            futures::stream::iter(events).boxed()
         });
 
         Ok(Box::pin(event_stream))
