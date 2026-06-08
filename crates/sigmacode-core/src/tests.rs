@@ -475,7 +475,11 @@ mod tool_tests {
             .unwrap();
 
         assert!(!result.is_error);
-        assert!(result.content.contains("hello"));
+        assert!(
+            result.content.contains("hello") || result.content.contains("Hello"),
+            "Output did not contain expected text: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

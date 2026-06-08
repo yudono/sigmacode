@@ -226,19 +226,27 @@ impl ExecuteTask {
                 return "Error: max iterations exceeded".into();
             }
 
+            eprintln!("[EXEC] iter={} msgs={}", iteration, messages.len());
+
             let mut stream = match tokio::time::timeout(
                 std::time::Duration::from_secs(120),
                 self.provider.complete_stream(&messages, tool_defs, &options),
             ).await {
                 Ok(Ok(s)) => s,
-                Ok(Err(e)) => return format!("Error: {}", e),
-                Err(_) => return "Error: LLM request timed out (120s)".into(),
+                Ok(Err(e)) => {
+                    eprintln!("[EXEC] LLM error: {}", e);
+                    return format!("Error: {}", e);
+                }
+                Err(_) => {
+                    eprintln!("[EXEC] LLM timeout");
+                    return "Error: LLM request timed out (120s)".into();
+                }
             };
 
             let mut assistant_content = String::new();
             loop {
                 let event = tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(120),
                     stream.next(),
                 ).await;
 
@@ -248,15 +256,26 @@ impl ExecuteTask {
                         let _ = self.event_tx.send(AgentEvent::Streaming { token: t });
                     }
                     Ok(Some(Ok(LlmEvent::Done { .. }))) => break,
-                    Ok(Some(Ok(LlmEvent::Error(e)))) => return format!("Error: {}", e),
+                    Ok(Some(Ok(LlmEvent::Error(e)))) => {
+                        eprintln!("[EXEC] Stream error: {}", e);
+                        return format!("Error: {}", e);
+                    }
                     Ok(Some(Ok(_))) => {}
                     Ok(None) => break,
-                    Err(_) => break,
-                    Ok(Some(Err(e))) => return format!("Error: {}", e),
+                    Err(_) => {
+                        eprintln!("[EXEC] Stream timeout (120s)");
+                        break;
+                    }
+                    Ok(Some(Err(e))) => {
+                        eprintln!("[EXEC] Stream err: {}", e);
+                        return format!("Error: {}", e);
+                    }
                 }
             }
 
+            eprintln!("[EXEC] Got {} chars", assistant_content.len());
             let tool_calls = parse_tool_calls_from_text(&assistant_content);
+            eprintln!("[EXEC] {} tool calls", tool_calls.len());
 
             messages.push(Message::Assistant {
                 content: Some(assistant_content.clone()),
@@ -281,6 +300,7 @@ impl ExecuteTask {
             });
 
             for tc in &tool_calls {
+                eprintln!("[EXEC] tool={} args={}", tc.name, tc.arguments);
                 let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
                     tool_name: tc.name.clone(),
                     args_summary: serde_json::to_string(&tc.arguments).unwrap_or_default(),
@@ -477,7 +497,7 @@ impl Agent {
 
         #[allow(unused_assignments)]
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(600),
             async {
                 let mut last_result = None;
                 loop {
