@@ -1,12 +1,13 @@
+use std::sync::Arc;
 use crate::llm::LlmProvider;
 use crate::types::{AgentEvent, CompletionOptions, Message, ReviewIssue, ReviewResult, ReviewSeverity};
 
 pub struct Reviewer {
-    provider: Box<dyn LlmProvider>,
+    provider: Arc<dyn LlmProvider>,
 }
 
 impl Reviewer {
-    pub fn new(provider: Box<dyn LlmProvider>) -> Self {
+    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
         Self { provider }
     }
 

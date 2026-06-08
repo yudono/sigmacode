@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::agent::analyzer::Analyzer;
@@ -19,20 +21,20 @@ pub struct Orchestrator {
     critic: Critic,
     reviewer: Reviewer,
     memory: MemoryManager,
-    tools: ToolRouter,
-    provider: Box<dyn LlmProvider>,
+    tools: Arc<ToolRouter>,
+    provider: Arc<dyn LlmProvider>,
 }
 
 impl Orchestrator {
     pub fn new(
-        provider: Box<dyn LlmProvider>,
-        tools: ToolRouter,
+        provider: Arc<dyn LlmProvider>,
+        tools: Arc<ToolRouter>,
         workspace: PathBuf,
     ) -> Self {
-        let analyzer = Analyzer::new(create_provider_for_analyzer(&provider));
+        let analyzer = Analyzer::new(provider.clone());
         let verifier = Verifier::new(workspace.clone());
-        let critic = Critic::new(create_provider_for_critic(&provider));
-        let reviewer = Reviewer::new(create_provider_for_reviewer(&provider));
+        let critic = Critic::new(provider.clone());
+        let reviewer = Reviewer::new(provider.clone());
         let memory = MemoryManager::new(workspace);
 
         Self {
@@ -264,7 +266,7 @@ Respond with a numbered list of steps."#,
             let mut assistant_content = String::new();
 
             loop {
-                let event = tokio::time::timeout(
+                let event: Result<Option<Result<crate::types::LlmEvent, crate::error::SigmaError>>, _> = tokio::time::timeout(
                     std::time::Duration::from_secs(120),
                     stream.next(),
                 ).await;
@@ -466,32 +468,3 @@ To use a tool, output a JSON block like this:
         summary
     }
 }
-
-// Helper to create provider instances for sub-agents
-fn create_provider_for_analyzer(_provider: &Box<dyn LlmProvider>) -> Box<dyn LlmProvider> {
-    // Create a new provider instance with the same config
-    // For now, use the same provider type
-    Box::new(crate::llm::OpenAiProvider::new(
-        String::new(), // will be overridden
-        String::new(),
-        String::new(),
-    ))
-}
-
-fn create_provider_for_critic(_provider: &Box<dyn LlmProvider>) -> Box<dyn LlmProvider> {
-    Box::new(crate::llm::OpenAiProvider::new(
-        String::new(),
-        String::new(),
-        String::new(),
-    ))
-}
-
-fn create_provider_for_reviewer(_provider: &Box<dyn LlmProvider>) -> Box<dyn LlmProvider> {
-    Box::new(crate::llm::OpenAiProvider::new(
-        String::new(),
-        String::new(),
-        String::new(),
-    ))
-}
-
-use futures::StreamExt;

@@ -1,12 +1,13 @@
+use std::sync::Arc;
 use crate::llm::LlmProvider;
 use crate::types::{AgentState, CompletionOptions, Message, TaskAnalysis};
 
 pub struct Analyzer {
-    provider: Box<dyn LlmProvider>,
+    provider: Arc<dyn LlmProvider>,
 }
 
 impl Analyzer {
-    pub fn new(provider: Box<dyn LlmProvider>) -> Self {
+    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
         Self { provider }
     }
 

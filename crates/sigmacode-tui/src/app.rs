@@ -824,15 +824,18 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     "bash" => {
                         if let Some(cmd) = args_summary.strip_prefix("command=") {
                             cmd.trim_matches('"').to_string()
+                        } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args_summary) {
+                            parsed["command"].as_str().unwrap_or(&args_summary).to_string()
                         } else {
                             args_summary
                         }
                     }
                     "write_file" | "edit_file" | "read_file" => {
-                        // Extract path from "path=..." format
                         if let Some(path) = args_summary.split(", ").next() {
                             if let Some(p) = path.strip_prefix("path=") {
                                 p.trim_matches('"').to_string()
+                            } else if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&args_summary) {
+                                parsed["path"].as_str().unwrap_or(&args_summary).to_string()
                             } else {
                                 args_summary
                             }
@@ -1037,6 +1040,110 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     content,
                     diff: None,
                 tool_output: false,
+                });
+            }
+            AgentEvent::AnalysisComplete { goals, constraints, success_criteria } => {
+                let mut content = String::from("**Analyzing task...**\n");
+                if !goals.is_empty() {
+                    content.push_str(&format!("Goals: {}\n", goals.join(", ")));
+                }
+                if !constraints.is_empty() {
+                    content.push_str(&format!("Constraints: {}\n", constraints.join(", ")));
+                }
+                if !success_criteria.is_empty() {
+                    content.push_str(&format!("Criteria: {}", success_criteria.join(", ")));
+                }
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content,
+                    diff: None,
+                    tool_output: false,
+                });
+            }
+            AgentEvent::PlanValidated { issues } => {
+                let content = if issues.is_empty() {
+                    "**Plan validated** — no issues".into()
+                } else {
+                    format!("**Plan validated** — {} issues: {}", issues.len(), issues.join(", "))
+                };
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content,
+                    diff: None,
+                    tool_output: false,
+                });
+            }
+            AgentEvent::VerificationStarted { step } => {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content: format!("**Verifying:** {}", step),
+                    diff: None,
+                    tool_output: false,
+                });
+            }
+            AgentEvent::VerificationPassed { step } => {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Tool,
+                    content: format!("  ✓ {} passed", step),
+                    diff: None,
+                    tool_output: true,
+                });
+            }
+            AgentEvent::VerificationFailed { step, errors } => {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Tool,
+                    content: format!("  ✗ {} failed: {}", step, errors.join(", ")),
+                    diff: None,
+                    tool_output: true,
+                });
+            }
+            AgentEvent::Criticking { errors } => {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content: format!("**Analyzing errors:** {}", errors.join(", ")),
+                    diff: None,
+                    tool_output: false,
+                });
+            }
+            AgentEvent::CriticResult { root_cause, fix } => {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content: format!("**Root cause:** {}\n**Fix:** {}", root_cause, fix),
+                    diff: None,
+                    tool_output: false,
+                });
+            }
+            AgentEvent::Replanning { reason, attempt } => {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content: format!("**Replanning** (attempt {}): {}", attempt, reason),
+                    diff: None,
+                    tool_output: false,
+                });
+            }
+            AgentEvent::Reviewing => {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content: "**Reviewing code...**".into(),
+                    diff: None,
+                    tool_output: false,
+                });
+            }
+            AgentEvent::ReviewComplete { score, issues_count } => {
+                let content = format!("**Review complete** — score: {}/100, {} issues", score, issues_count);
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content,
+                    diff: None,
+                    tool_output: false,
+                });
+            }
+            AgentEvent::Finalizing => {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content: "**Finalizing...**".into(),
+                    diff: None,
+                    tool_output: false,
                 });
             }
             _ => {}

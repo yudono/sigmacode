@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::orchestrator::Orchestrator;
 use crate::context::ContextBuilder;
 use crate::error::{Result, SigmaError};
 use crate::llm::LlmProvider;
@@ -12,10 +13,11 @@ use crate::tools::{ToolContext, ToolRouter};
 use crate::types::*;
 
 use async_trait::async_trait;
-use graph_flow::{self as gf, Context, ExecutionStatus, FlowRunner, GraphBuilder, GraphError, InMemorySessionStorage, NextAction, Session, SessionStorage, TaskResult as GfTaskResult};
+use graph_flow::{self as gf, Context, GraphError, NextAction, TaskResult as GfTaskResult};
 
-// ── Graph Pipeline Tasks ──
+// ── Graph Pipeline Tasks (kept as fallback, unused when orchestrator is active) ──
 
+#[allow(dead_code)]
 struct SecurityCheckTask {
     guard: SecurityGuard,
 }
@@ -41,6 +43,7 @@ impl gf::Task for SecurityCheckTask {
     }
 }
 
+#[allow(dead_code)]
 struct PlanTask {
     provider: Arc<dyn LlmProvider>,
     tool_defs: Vec<ToolDefinition>,
@@ -136,6 +139,7 @@ Respond with a JSON object:
     }
 }
 
+#[allow(dead_code)]
 struct ExecuteTask {
     provider: Arc<dyn LlmProvider>,
     tools: Arc<ToolRouter>,
@@ -191,6 +195,7 @@ impl gf::Task for ExecuteTask {
     }
 }
 
+#[allow(dead_code)]
 impl ExecuteTask {
     async fn execute_task(
         &self,
@@ -300,7 +305,6 @@ impl ExecuteTask {
             });
 
             for tc in &tool_calls {
-                eprintln!("[EXEC] tool={} args={}", tc.name, tc.arguments);
                 let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
                     tool_name: tc.name.clone(),
                     args_summary: serde_json::to_string(&tc.arguments).unwrap_or_default(),
@@ -372,6 +376,7 @@ impl ExecuteTask {
     }
 }
 
+#[allow(dead_code)]
 struct SummarizeTask;
 
 #[async_trait]
@@ -437,122 +442,32 @@ impl Agent {
     pub async fn run(
         &self,
         state: &mut AgentState,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
         event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> Result<String> {
-        let send_event = |event: AgentEvent| {
-            if let Some(ref tx) = event_tx {
-                let _ = tx.send(event);
-            }
-        };
-
-        send_event(AgentEvent::Thinking { content: "Creating pipeline...".into() });
-
-        let tool_defs = self.tools.definitions();
-
-        let security_task = SecurityCheckTask {
-            guard: self.security.clone(),
-        };
-        let plan_task = PlanTask {
-            provider: self.provider.clone(),
-            tool_defs: tool_defs.clone(),
-        };
-        let exec_task = ExecuteTask {
-            provider: self.provider.clone(),
-            tools: self.tools.clone(),
-            security: self.security.clone(),
-            rate_limiter: self.rate_limiter.clone(),
-            event_tx: event_tx.clone().unwrap_or_else(|| {
-                let (tx, _) = tokio::sync::mpsc::unbounded_channel();
-                tx
-            }),
-        };
-        let summarize_task = SummarizeTask;
-
-        let graph = Arc::new(
-            GraphBuilder::new("sigmacode")
-                .add_task(Arc::new(security_task))
-                .add_task(Arc::new(plan_task))
-                .add_task(Arc::new(exec_task))
-                .add_task(Arc::new(summarize_task))
-                .set_start_task("security_check")
-                .add_edge("security_check", "plan")
-                .add_edge("plan", "execute")
-                .add_edge("execute", "summarize")
-                .build(),
+        let request = state.task.clone();
+        let mut orchestrator = Orchestrator::new(
+            self.provider.clone(),
+            self.tools.clone(),
+            state.workspace.clone(),
         );
 
-        let storage = Arc::new(InMemorySessionStorage::new());
-        let runner = FlowRunner::new(graph, storage.clone());
+        let result = orchestrator.run(&request, state, cancel, &event_tx).await;
 
-        let session_id = format!("session-{}", uuid::Uuid::new_v4());
-        let session = Session::new_from_task(session_id.clone(), "security_check");
-        session.context.set("task", state.task.clone()).await;
-        session.context.set("model", state.config.model.clone()).await;
-        session.context.set("api_key", state.config.api_key.clone()).await;
-        session.context.set("base_url", state.config.base_url.clone()).await;
-        session.context.set("workspace", state.workspace.to_string_lossy().to_string()).await;
-        session.context.set("tool_defs", tool_defs).await;
-        storage.save(session).await.map_err(|e| SigmaError::Other(e.to_string()))?;
-
-        #[allow(unused_assignments)]
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(600),
-            async {
-                let mut last_result = None;
-                loop {
-                    match runner.run(&session_id).await {
-                        Ok(result) => {
-                            match &result.status {
-                                ExecutionStatus::Completed | ExecutionStatus::WaitingForInput => {
-                                    last_result = Some(result);
-                                    break;
-                                }
-                                ExecutionStatus::Error(_) => {
-                                    last_result = Some(result);
-                                    break;
-                                }
-                                ExecutionStatus::Paused { next_task_id: _, .. } => {
-                                    last_result = Some(result);
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            return Err(SigmaError::Other(e.to_string()));
-                        }
-                    }
+        match &result {
+            Ok(summary) => {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(AgentEvent::Done { summary: summary.clone() });
                 }
-                Ok(last_result.unwrap_or_else(|| graph_flow::ExecutionResult {
-                    response: None,
-                    status: ExecutionStatus::Completed,
-                }))
             }
-        ).await
-            .map_err(|_| SigmaError::Llm("Pipeline timed out (300s)".into()))?
-            ?;
-
-        match result.status {
-            ExecutionStatus::Completed => {
-                let summary = result.response.unwrap_or_default();
-                send_event(AgentEvent::Done { summary: summary.clone() });
-                Ok(summary)
-            }
-            ExecutionStatus::Error(e) => {
-                send_event(AgentEvent::Error { message: e.clone() });
-                Err(SigmaError::Llm(e))
-            }
-            ExecutionStatus::Paused { .. } => {
-                let summary = result.response.unwrap_or_default();
-                send_event(AgentEvent::Done { summary: summary.clone() });
-                Ok(summary)
-            }
-            ExecutionStatus::WaitingForInput => {
-                let summary = result.response.unwrap_or_default();
-                send_event(AgentEvent::Done { summary: summary.clone() });
-                Ok(summary)
+            Err(e) => {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(AgentEvent::Error { message: e.to_string() });
+                }
             }
         }
+
+        result
     }
 
     pub async fn run_task(
@@ -841,6 +756,37 @@ pub fn parse_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
         }
     }
 
+    if tool_calls.is_empty() {
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len();
+        let mut depth = 0i32;
+        let mut start_idx: Option<usize> = None;
+        let mut i = 0;
+        while i < len {
+            match chars[i] {
+                '{' => {
+                    if depth == 0 {
+                        start_idx = Some(i);
+                    }
+                    depth += 1;
+                }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start_idx.take() {
+                            let json_str: String = chars[s..=i].iter().collect();
+                            if let Some(tc) = parse_tool_json(&json_str) {
+                                tool_calls.push(tc);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
     tool_calls
 }
 
@@ -858,6 +804,7 @@ fn parse_tool_json(json_str: &str) -> Option<ToolCall> {
     None
 }
 
+#[allow(dead_code)]
 fn extract_json(text: &str) -> String {
     if let Some(start) = text.find("```json") {
         let json_start = start + 7;
@@ -908,6 +855,29 @@ mod tests {
         let text = "This is just regular assistant text with no tool calls.";
         let calls = parse_tool_calls_from_text(text);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tool_call_with_surrounding_text() {
+        let text = r#"I'll create the project for you.
+
+{"tool": "bash", "args": {"command": "npx create-vite@latest landing-page --template react"}}"#;
+        let calls = parse_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "npx create-vite@latest landing-page --template react");
+    }
+
+    #[test]
+    fn test_parse_multiple_tool_calls_in_text() {
+        let text = r#"First let me check the directory:
+{"tool": "bash", "args": {"command": "ls -la"}}
+Then I'll read the file:
+{"tool": "read_file", "args": {"path": "package.json"}}"#;
+        let calls = parse_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[1].name, "read_file");
     }
 
 }
