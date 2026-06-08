@@ -19,6 +19,13 @@ pub struct App {
     pub config: AppConfig,
     pub current_tab: Tab,
     pub logs: Vec<String>,
+    pub scroll_offset: usize,
+    pub tick_count: usize,
+    pub token_display: String,
+    pub context_usage_pct: u32,
+    pub cost: f64,
+    pub token_usage: String,
+    pub total_tokens: usize,
 }
 
 #[derive(PartialEq)]
@@ -67,25 +74,42 @@ impl App {
             config,
             current_tab: Tab::Chat,
             logs: Vec::new(),
+            scroll_offset: 0,
+            tick_count: 0,
+            token_display: "0 tokens".into(),
+            context_usage_pct: 0,
+            cost: 0.0,
+            token_usage: "0".into(),
+            total_tokens: 0,
         })
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         match self.state {
-            AppState::Idle | AppState::Done => {
-                match key.code {
-                    crossterm::event::KeyCode::Char('i') => {
-                        self.state = AppState::Input;
-                    }
-                    crossterm::event::KeyCode::Char('l') => {
-                        self.current_tab = Tab::Logs;
-                    }
-                    crossterm::event::KeyCode::Char('c') => {
-                        self.current_tab = Tab::Chat;
-                    }
-                    _ => {}
+            AppState::Idle | AppState::Done => match key.code {
+                crossterm::event::KeyCode::Char('i') => {
+                    self.state = AppState::Input;
                 }
-            }
+                crossterm::event::KeyCode::Char('l') => {
+                    self.current_tab = Tab::Logs;
+                }
+                crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Esc => {
+                    self.current_tab = Tab::Chat;
+                }
+                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                }
+                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                }
+                crossterm::event::KeyCode::Char('g') => {
+                    self.scroll_offset = usize::MAX;
+                }
+                crossterm::event::KeyCode::Char('G') => {
+                    self.scroll_offset = 0;
+                }
+                _ => {}
+            },
             AppState::Input => match key.code {
                 crossterm::event::KeyCode::Enter => {
                     if !self.input.trim().is_empty() {
@@ -95,7 +119,11 @@ impl App {
                     }
                 }
                 crossterm::event::KeyCode::Esc => {
-                    self.state = AppState::Idle;
+                    self.state = if self.messages.is_empty() {
+                        AppState::Idle
+                    } else {
+                        AppState::Done
+                    };
                     self.input.clear();
                 }
                 crossterm::event::KeyCode::Backspace => {
@@ -111,6 +139,8 @@ impl App {
     }
 
     pub async fn tick(&mut self) {
+        self.tick_count += 1;
+
         let events: Vec<AgentEvent> = if let Some(rx) = &mut self.event_rx {
             let mut events = Vec::new();
             while let Ok(event) = rx.try_recv() {
@@ -136,6 +166,7 @@ impl App {
 
         self.state = AppState::Running;
         self.event_rx = Some(event_rx);
+        self.scroll_offset = 0;
 
         let provider = create_provider(&self.config.provider);
         let tools = ToolRouter::default();
@@ -188,54 +219,57 @@ impl App {
     fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Planning { goal } => {
-                self.logs.push(format!("Planning: {}", goal));
+                self.logs.push(format!("[plan] {}", goal));
+                self.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("planning: {}", goal),
+                });
             }
             AgentEvent::PlanCreated { tasks } => {
                 self.logs
-                    .push(format!("Plan created with {} tasks", tasks.len()));
-                let task_list: Vec<String> = tasks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| format!("  {}. {}", i + 1, t.instruction))
-                    .collect();
-                self.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: format!("Plan:\n{}", task_list.join("\n")),
-                });
+                    .push(format!("[plan] {} tasks created", tasks.len()));
             }
             AgentEvent::TaskStarted {
                 task_type,
                 instruction,
                 ..
             } => {
-                self.logs
-                    .push(format!("Task: {} - {}", task_type, instruction));
+                self.logs.push(format!("[exec] {}: {}", task_type, instruction));
+                let short: String = instruction.chars().take(60).collect();
+                self.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("{}: {}", task_type, short),
+                });
             }
             AgentEvent::TaskCompleted {
-                success, output, ..
+                success, output: _, ..
             } => {
                 self.logs.push(format!(
-                    "Task completed: {}",
-                    if success { "success" } else { "failed" }
+                    "[done] {}",
+                    if success { "ok" } else { "failed" }
                 ));
-                if !output.is_empty() && output.len() < 500 {
-                    self.logs.push(format!("  Output: {}", output));
-                }
             }
             AgentEvent::ToolCallStarted { tool_name, .. } => {
-                self.logs.push(format!("Tool call: {}", tool_name));
+                self.logs.push(format!("[tool] {}", tool_name));
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Tool,
+                    content: tool_name,
+                });
             }
             AgentEvent::ToolCallCompleted {
                 tool_name,
                 success,
             } => {
-                self.logs.push(format!(
-                    "Tool {} completed: {}",
-                    tool_name,
-                    if success { "ok" } else { "failed" }
-                ));
+                self.logs
+                    .push(format!("[tool] {} → {}", tool_name, if success { "ok" } else { "err" }));
             }
             AgentEvent::Streaming { token } => {
+                self.total_tokens += token.len() / 4;
+                self.token_display = format_tokens(self.total_tokens);
+                self.token_usage = format_tokens(self.total_tokens);
+                self.context_usage_pct = ((self.total_tokens as f64 / 128_000.0) * 100.0) as u32;
+                self.cost = (self.total_tokens as f64 / 1_000_000.0) * 2.50;
+
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == MessageRole::Assistant {
                         last.content.push_str(&token);
@@ -250,7 +284,7 @@ impl App {
             AgentEvent::Error { message } => {
                 self.messages.push(ChatMessage {
                     role: MessageRole::System,
-                    content: format!("Error: {}", message),
+                    content: format!("error: {}", message),
                 });
                 self.state = AppState::Done;
             }
@@ -275,6 +309,16 @@ impl App {
 
     pub fn is_idle(&self) -> bool {
         self.state == AppState::Idle || self.state == AppState::Done
+    }
+}
+
+fn format_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M tokens", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K tokens", n as f64 / 1_000.0)
+    } else {
+        format!("{} tokens", n)
     }
 }
 
