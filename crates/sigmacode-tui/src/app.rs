@@ -121,6 +121,7 @@ pub struct App {
     pub cmd_selected: usize,
     pub queue: VecDeque<String>,
     pub pending_tool_call: String,
+    pub in_tool_result: bool,
 }
 
 pub struct CmdChoice {
@@ -273,6 +274,7 @@ impl App {
             cmd_selected: 0,
             queue: VecDeque::new(),
             pending_tool_call: String::new(),
+            in_tool_result: false,
         })
     }
 
@@ -874,6 +876,8 @@ Use these naturally - the agent decides which tool to use based on your task."#
                 });
             }
             AgentEvent::ToolOutput { tool_call_id: _, line } => {
+                let line = strip_tool_result_tags(&line);
+                if line.trim().is_empty() { return; }
                 self.logs.push(format!("[output] {}", line));
                 // Append to last assistant message or create a new tool output message
                 if let Some(last) = self.messages.last_mut() {
@@ -899,8 +903,38 @@ Use these naturally - the agent decides which tool to use based on your task."#
 
                 self.pending_tool_call.push_str(&token);
 
+                // State machine: suppress <tool_result>...</tool_result> blocks from MiMo API
+                if self.in_tool_result {
+                    if let Some(end) = self.pending_tool_call.find("</tool_result>") {
+                        let after = &self.pending_tool_call[end + 14..];
+                        self.pending_tool_call = after.to_string();
+                        self.in_tool_result = false;
+                    } else if let Some(end) = self.pending_tool_call.find("</tool_result") {
+                        let after = &self.pending_tool_call[end + 13..];
+                        self.pending_tool_call = after.to_string();
+                        self.in_tool_result = false;
+                    } else {
+                        self.pending_tool_call.clear();
+                        return;
+                    }
+                }
+
+                if self.pending_tool_call.contains("<tool_result>") {
+                    if let Some(end) = self.pending_tool_call.find("</tool_result>") {
+                        let before_end = self.pending_tool_call[..self.pending_tool_call.find("<tool_result>").unwrap()].to_string();
+                        let after = &self.pending_tool_call[end + 14..];
+                        self.pending_tool_call = format!("{}{}", before_end, after);
+                    } else {
+                        let before = self.pending_tool_call[..self.pending_tool_call.find("<tool_result>").unwrap()].to_string();
+                        self.pending_tool_call = before;
+                        self.in_tool_result = true;
+                        if self.pending_tool_call.trim().is_empty() {
+                            return;
+                        }
+                    }
+                }
+
                 // If we're inside a tool_call block, just buffer and wait for it to complete.
-                // ToolCallStarted already displays the tool call, so we discard the raw block.
                 let pt = &self.pending_tool_call;
                 let in_marker_block = pt.contains("```tool_call") || pt.contains("```json");
                 // Also detect raw JSON tool calls without markdown wrappers: {"tool": "...", "args": ...}
@@ -970,21 +1004,24 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     self.pending_tool_call = remaining;
 
                     if !complete.is_empty() {
-                        if let Some(last) = self.messages.last_mut() {
-                            if last.role == MessageRole::Assistant {
-                                if !last.content.is_empty() {
-                                    last.content.push('\n');
+                        let complete = strip_tool_result_tags(&complete);
+                        if !complete.trim().is_empty() {
+                            if let Some(last) = self.messages.last_mut() {
+                                if last.role == MessageRole::Assistant {
+                                    if !last.content.is_empty() {
+                                        last.content.push('\n');
+                                    }
+                                    last.content.push_str(&complete);
+                                    return;
                                 }
-                                last.content.push_str(&complete);
-                                return;
                             }
+                            self.messages.push(ChatMessage {
+                                role: MessageRole::Assistant,
+                                content: complete,
+                                diff: None,
+                            tool_output: false,
+                            });
                         }
-                        self.messages.push(ChatMessage {
-                            role: MessageRole::Assistant,
-                            content: complete,
-                            diff: None,
-                        tool_output: false,
-                        });
                     }
                 }
             }
@@ -1162,8 +1199,9 @@ Use these naturally - the agent decides which tool to use based on your task."#
         if self.pending_tool_call.is_empty() {
             return;
         }
-        let remaining = self.pending_tool_call.trim().to_string();
+        let remaining = strip_tool_result_tags(&self.pending_tool_call.trim());
         self.pending_tool_call.clear();
+        self.in_tool_result = false;
         if remaining.is_empty() {
             return;
         }
@@ -1219,6 +1257,23 @@ fn needs_setup_wizard(config: &SigmaConfig) -> bool {
         "ollama" => false,
         _ => config.api_key.is_empty() || config.api_key == "your-api-key-here",
     }
+}
+
+fn strip_tool_result_tags(text: &str) -> String {
+    let mut result = text.to_string();
+    loop {
+        if let Some(start) = result.find("<tool_result>") {
+            if let Some(end) = result[start..].find("</tool_result>") {
+                result = format!("{}{}", &result[..start], &result[start + end + 14..]);
+            } else {
+                result = result[..start].to_string();
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    result
 }
 
 fn build_diff_view(file_path: &str, old: &str, new: &str) -> DiffView {
