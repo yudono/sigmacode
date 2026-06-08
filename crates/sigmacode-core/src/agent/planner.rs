@@ -67,7 +67,7 @@ The task_type must be one of the available tool names."#,
         let options = CompletionOptions {
             temperature: Some(0.0),
             max_tokens: Some(2048),
-            tool_choice: Some("none".into()),
+            tool_choice: None,
         };
 
         let response = self

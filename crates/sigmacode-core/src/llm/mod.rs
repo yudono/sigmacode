@@ -78,12 +78,14 @@ impl OpenAiProvider {
             "temperature": options.temperature.unwrap_or(0.0),
         });
 
-        if !tool_defs.is_empty() {
+        if !tool_defs.is_empty() && options.tool_choice.is_some() {
             body["tools"] = serde_json::json!(tool_defs);
         }
 
         if let Some(ref choice) = options.tool_choice {
-            body["tool_choice"] = serde_json::json!(choice);
+            if choice != "none" {
+                body["tool_choice"] = serde_json::json!(choice);
+            }
         }
 
         if stream {

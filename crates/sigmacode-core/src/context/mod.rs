@@ -1,8 +1,9 @@
-use crate::types::AgentState;
+use crate::types::{AgentState, ToolDefinition};
 
 pub struct ContextBuilder {
     project_name: String,
     custom_instructions: Option<String>,
+    tools: Vec<ToolDefinition>,
 }
 
 impl ContextBuilder {
@@ -10,6 +11,7 @@ impl ContextBuilder {
         Self {
             project_name: project_name.into(),
             custom_instructions: None,
+            tools: Vec::new(),
         }
     }
 
@@ -18,7 +20,29 @@ impl ContextBuilder {
         self
     }
 
+    pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
+        self.tools = tools;
+        self
+    }
+
     pub fn build_system_prompt(&self, state: &AgentState) -> String {
+        let tool_list: Vec<String> = self.tools
+            .iter()
+            .map(|t| {
+                let params = serde_json::to_string_pretty(&t.parameters).unwrap_or_default();
+                format!("- {}: {}\n  Parameters: {}", t.name, t.description, params)
+            })
+            .collect();
+
+        let tools_section = if !self.tools.is_empty() {
+            format!(
+                "\n## Available Tools\n\n{}\n\nTo use a tool, output a JSON block like this:\n```tool_call\n{{\"tool\": \"tool_name\", \"args\": {{\"param\": \"value\"}}}}\n```\nThe system will execute the tool and return the result.",
+                tool_list.join("\n\n")
+            )
+        } else {
+            String::new()
+        };
+
         let mut prompt = format!(
             r#"You are SigmaCode, an expert AI coding assistant.
 
@@ -36,16 +60,17 @@ You have access to tools for reading, writing, and editing files, running shell 
 7. Run bash commands to verify changes (npm run build, cargo check, etc.)
 8. Be concise in your responses - focus on the task
 9. Never expose secrets, API keys, or sensitive data
-10. If you're unsure about something, ask the user"#,
-            self.project_name
+10. If you're unsure about something, ask the user{}
+"#,
+            self.project_name, tools_section
         );
 
         if let Some(ref instructions) = self.custom_instructions {
-            prompt.push_str(&format!("\n\n## Additional Instructions\n{}", instructions));
+            prompt.push_str(&format!("\n## Additional Instructions\n{}\n", instructions));
         }
 
         prompt.push_str(&format!(
-            "\n\n## Working Directory\n{}\n\n## Session Info\n- Iteration: {}\n- Max Iterations: {}",
+            "\n## Working Directory\n{}\n\n## Session Info\n- Iteration: {}\n- Max Iterations: {}",
             state.workspace.display(),
             state.iteration + 1,
             state.config.max_iterations,

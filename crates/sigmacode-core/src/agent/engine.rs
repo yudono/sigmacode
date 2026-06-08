@@ -19,8 +19,10 @@ impl Agent {
     pub fn new(
         provider: Box<dyn LlmProvider>,
         tools: ToolRouter,
-        context_builder: ContextBuilder,
+        mut context_builder: ContextBuilder,
     ) -> Self {
+        let tool_defs = tools.definitions();
+        context_builder = context_builder.with_tools(tool_defs);
         Self {
             provider: Arc::from(provider),
             tools,
@@ -155,6 +157,11 @@ impl Agent {
                 tool_calls.push(tc);
             }
 
+            // Parse tool calls from text if no native tool calls
+            if tool_calls.is_empty() && !assistant_content.is_empty() {
+                tool_calls = parse_tool_calls_from_text(&assistant_content);
+            }
+
             // Add assistant message
             state.messages.push(Message::Assistant {
                 content: if assistant_content.is_empty() {
@@ -271,4 +278,48 @@ impl Agent {
 
         Ok(())
     }
+}
+
+fn parse_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
+    let mut tool_calls = Vec::new();
+
+    // Look for ```tool_call ... ``` blocks
+    if let Some(start) = text.find("```tool_call") {
+        let content_start = start + 11; // len of "```tool_call"
+        if let Some(end) = text[content_start..].find("```") {
+            let json_str = text[content_start..content_start + end].trim();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(tool_name) = parsed["tool"].as_str() {
+                    let args = parsed.get("args").cloned().unwrap_or_default();
+                    tool_calls.push(ToolCall {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: tool_name.to_string(),
+                        arguments: args,
+                    });
+                }
+            }
+        }
+    }
+
+    // Also look for JSON blocks with tool_call format
+    if tool_calls.is_empty() {
+        if let Some(start) = text.find("```json") {
+            let content_start = start + 7;
+            if let Some(end) = text[content_start..].find("```") {
+                let json_str = text[content_start..content_start + end].trim();
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(tool_name) = parsed["tool"].as_str() {
+                        let args = parsed.get("args").cloned().unwrap_or_default();
+                        tool_calls.push(ToolCall {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            name: tool_name.to_string(),
+                            arguments: args,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    tool_calls
 }
