@@ -83,8 +83,19 @@ impl OpenAiProvider {
             .map(|m| {
                 let mut v = serde_json::to_value(m).unwrap_or_default();
                 if let Some(obj) = v.as_object_mut() {
-                    if obj.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                    let role = obj.get("role").and_then(|r| r.as_str()).map(String::from);
+                    let tool_content = if role.as_deref() == Some("tool") {
+                        obj.get("content").and_then(|c| c.as_str()).map(String::from)
+                    } else {
+                        None
+                    };
+                    if role.as_deref() == Some("assistant") {
                         obj.remove("tool_calls");
+                    }
+                    if let Some(content) = tool_content {
+                        obj.insert("role".into(), serde_json::json!("user"));
+                        obj.insert("content".into(), serde_json::json!(format!("[Tool result]\n{}", content)));
+                        obj.remove("tool_call_id");
                     }
                 }
                 v

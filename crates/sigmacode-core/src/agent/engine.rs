@@ -154,7 +154,14 @@ After executing, respond with a brief summary of what was done."#,
                 let mut current_tool_call: Option<ToolCall> = None;
 
                 let mut stream = response;
-                while let Some(event) = stream.next().await {
+                loop {
+                    let event = tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        stream.next(),
+                    ).await;
+
+                    match event {
+                        Ok(Some(event)) => {
                     if cancel.is_cancelled() {
                         return Err(SigmaError::Cancelled);
                     }
@@ -217,6 +224,15 @@ After executing, respond with a brief summary of what was done."#,
                                 message: e.clone(),
                             });
                             return Err(SigmaError::Llm(e));
+                        }
+                    }
+                        }
+                        Ok(None) => break, // stream ended
+                        Err(_) => {
+                            send_event(AgentEvent::Error {
+                                message: "LLM stream timed out (60s)".into(),
+                            });
+                            break;
                         }
                     }
                 }
