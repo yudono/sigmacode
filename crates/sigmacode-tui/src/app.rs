@@ -822,9 +822,20 @@ Use these naturally - the agent decides which tool to use based on your task."#
                 };
                 let detail = match tool_name.as_str() {
                     "bash" => {
-                        // Extract the actual command from "command=..." format
                         if let Some(cmd) = args_summary.strip_prefix("command=") {
                             cmd.trim_matches('"').to_string()
+                        } else {
+                            args_summary
+                        }
+                    }
+                    "write_file" | "edit_file" | "read_file" => {
+                        // Extract path from "path=..." format
+                        if let Some(path) = args_summary.split(", ").next() {
+                            if let Some(p) = path.strip_prefix("path=") {
+                                p.trim_matches('"').to_string()
+                            } else {
+                                args_summary
+                            }
                         } else {
                             args_summary
                         }

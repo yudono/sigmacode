@@ -59,8 +59,12 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(api_key: String, base_url: String, model: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key,
             base_url,
             model,
@@ -96,7 +100,6 @@ impl OpenAiProvider {
 
         if stream {
             body["stream"] = serde_json::json!(true);
-            body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
 
         body
@@ -221,6 +224,9 @@ impl LlmProvider for OpenAiProvider {
                     continue;
                 }
                 if line == "data: [DONE]" {
+                    events.push(Ok(LlmEvent::Done {
+                        usage: TokenUsage::default(),
+                    }));
                     break;
                 }
                 if let Some(data) = line.strip_prefix("data: ") {
