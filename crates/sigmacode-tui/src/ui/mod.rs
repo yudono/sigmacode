@@ -66,10 +66,27 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
             MessageRole::Tool => {
+                let content = msg.content.clone();
+                // Check if it starts with a tool icon (from our formatter)
+                let (icon, text) = if content.starts_with("  $ ") {
+                    ("◆ ", format!("$ {}", &content[4..]))
+                } else if content.starts_with("  read ") {
+                    ("◆ ", format!("read {}", &content[7..]))
+                } else if content.starts_with("  write ") {
+                    ("◆ ", format!("write {}", &content[8..]))
+                } else if content.starts_with("  edit ") {
+                    ("◆ ", format!("edit {}", &content[7..]))
+                } else if content.starts_with("  glob ") {
+                    ("◆ ", format!("glob {}", &content[7..]))
+                } else if content.starts_with("  grep ") {
+                    ("◆ ", format!("grep {}", &content[7..]))
+                } else {
+                    ("◆ ", content)
+                };
                 lines.push(Line::from(vec![
                     Span::styled("   ", Style::default()),
-                    Span::styled("◆ ", Style::default().fg(ACCENT)),
-                    Span::styled(msg.content.clone(), Style::default().fg(DIM)),
+                    Span::styled(icon, Style::default().fg(ACCENT)),
+                    Span::styled(text, Style::default().fg(DIM)),
                 ]));
             }
             MessageRole::Thought => {

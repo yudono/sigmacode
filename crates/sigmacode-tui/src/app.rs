@@ -66,6 +66,7 @@ pub struct DiffView {
     pub new_lines: Vec<DiffLine>,
 }
 
+#[allow(dead_code)]
 pub struct DiffLine {
     pub line_num: usize,
     pub content: String,
@@ -73,6 +74,7 @@ pub struct DiffLine {
     pub is_removed: bool,
 }
 
+#[allow(dead_code)]
 pub struct PermissionRequest {
     pub tool_name: String,
     pub description: String,
@@ -298,9 +300,18 @@ impl App {
                 args_summary: _,
             } => {
                 self.logs.push(format!("[tool] {}", tool_name));
+                let icon = match tool_name.as_str() {
+                    "bash" => "$",
+                    "read_file" => "read",
+                    "write_file" => "write",
+                    "edit_file" => "edit",
+                    "glob" => "glob",
+                    "grep" => "grep",
+                    _ => "tool",
+                };
                 self.messages.push(ChatMessage {
                     role: MessageRole::Tool,
-                    content: format!("◆ {}", tool_name),
+                    content: format!("  {} {}", icon, tool_name),
                     diff: None,
                 });
             }
@@ -318,9 +329,21 @@ impl App {
                     ((self.total_tokens as f64 / 128_000.0) * 100.0).min(100.0) as u32;
                 self.cost = (self.total_tokens as f64 / 1_000_000.0) * 2.50;
 
+                // Accumulate content and detect tool_call blocks
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == MessageRole::Assistant {
                         last.content.push_str(&token);
+                        // Check for complete tool_call block
+                        if let Some(tc) = extract_tool_call_display(&last.content) {
+                            // Remove raw block from assistant content
+                            last.content = last.content[..tc.raw_start].trim_end().to_string();
+                            // Add formatted tool call message
+                            self.messages.push(ChatMessage {
+                                role: MessageRole::Tool,
+                                content: tc.formatted,
+                                diff: None,
+                            });
+                        }
                         return;
                     }
                 }
@@ -390,6 +413,7 @@ impl App {
         self.should_quit
     }
 
+    #[allow(dead_code)]
     pub fn is_idle(&self) -> bool {
         self.state == AppState::Idle || self.state == AppState::Done
     }
@@ -432,6 +456,93 @@ fn format_tokens(n: usize) -> String {
         format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         format!("{}", n)
+    }
+}
+
+struct ToolCallDisplay {
+    raw_start: usize,
+    formatted: String,
+}
+
+fn extract_tool_call_display(content: &str) -> Option<ToolCallDisplay> {
+    // Look for ```tool_call ... ``` blocks
+    if let Some(start) = content.find("```tool_call") {
+        let content_start = start + 11;
+        if let Some(end) = content[content_start..].find("```") {
+            let json_str = content[content_start..content_start + end].trim();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(tool_name) = parsed["tool"].as_str() {
+                    let args = parsed.get("args").cloned().unwrap_or_default();
+                    let formatted = format_tool_call(tool_name, &args);
+                    return Some(ToolCallDisplay {
+                        raw_start: start,
+                        formatted,
+                    });
+                }
+            }
+        }
+    }
+
+    // Also look for ```json ... ``` blocks with tool call format
+    if let Some(start) = content.find("```json") {
+        let content_start = start + 7;
+        if let Some(end) = content[content_start..].find("```") {
+            let json_str = content[content_start..content_start + end].trim();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(tool_name) = parsed["tool"].as_str() {
+                    let args = parsed.get("args").cloned().unwrap_or_default();
+                    let formatted = format_tool_call(tool_name, &args);
+                    return Some(ToolCallDisplay {
+                        raw_start: start,
+                        formatted,
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn format_tool_call(tool_name: &str, args: &serde_json::Value) -> String {
+    let icon = match tool_name {
+        "bash" => "$",
+        "read_file" => "read",
+        "write_file" => "write",
+        "edit_file" => "edit",
+        "glob" => "glob",
+        "grep" => "grep",
+        _ => "tool",
+    };
+
+    match tool_name {
+        "bash" => {
+            let cmd = args["command"].as_str().unwrap_or("...");
+            format!("  {} {}", icon, cmd)
+        }
+        "read_file" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            format!("  {} {}", icon, path)
+        }
+        "write_file" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            format!("  {} {}", icon, path)
+        }
+        "edit_file" => {
+            let path = args["path"].as_str().unwrap_or("?");
+            format!("  {} {}", icon, path)
+        }
+        "glob" => {
+            let pattern = args["pattern"].as_str().unwrap_or("?");
+            format!("  {} {}", icon, pattern)
+        }
+        "grep" => {
+            let pattern = args["pattern"].as_str().unwrap_or("?");
+            format!("  {} {}", icon, pattern)
+        }
+        _ => {
+            format!("  {} {} {}", icon, tool_name, args)
+        }
     }
 }
 

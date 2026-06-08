@@ -26,6 +26,28 @@ pub trait LlmProvider: Send + Sync {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>>;
 }
 
+// ── Error Parsing ──
+
+fn parse_error_message(text: &str) -> String {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(msg) = json["error"]["message"].as_str() {
+            return msg.to_string();
+        }
+        if let Some(msg) = json["message"].as_str() {
+            return msg.to_string();
+        }
+        if let Some(msg) = json["error"].as_str() {
+            return msg.to_string();
+        }
+    }
+    let clean = text.trim();
+    if clean.len() > 200 {
+        format!("{}...", &clean[..200])
+    } else {
+        clean.to_string()
+    }
+}
+
 // ── OpenAI-Compatible Provider ──
 
 pub struct OpenAiProvider {
@@ -48,26 +70,20 @@ impl OpenAiProvider {
     fn build_request_body(
         &self,
         messages: &[Message],
-        tools: &[crate::types::ToolDefinition],
+        _tools: &[crate::types::ToolDefinition],
         options: &CompletionOptions,
         stream: bool,
     ) -> serde_json::Value {
         let msgs: Vec<serde_json::Value> = messages
             .iter()
-            .map(|m| serde_json::to_value(m).unwrap_or_default())
-            .collect();
-
-        let tool_defs: Vec<serde_json::Value> = tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters
+            .map(|m| {
+                let mut v = serde_json::to_value(m).unwrap_or_default();
+                if let Some(obj) = v.as_object_mut() {
+                    if obj.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        obj.remove("tool_calls");
                     }
-                })
+                }
+                v
             })
             .collect();
 
@@ -77,16 +93,6 @@ impl OpenAiProvider {
             "max_tokens": options.max_tokens.unwrap_or(4096),
             "temperature": options.temperature.unwrap_or(0.0),
         });
-
-        if !tool_defs.is_empty() && options.tool_choice.is_some() {
-            body["tools"] = serde_json::json!(tool_defs);
-        }
-
-        if let Some(ref choice) = options.tool_choice {
-            if choice != "none" {
-                body["tool_choice"] = serde_json::json!(choice);
-            }
-        }
 
         if stream {
             body["stream"] = serde_json::json!(true);
@@ -123,13 +129,14 @@ impl LlmProvider for OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let text = response.text().await.unwrap_or_default();
+            let msg = parse_error_message(&text);
             if status == 429 {
                 return Err(crate::error::SigmaError::RateLimited { retry_after_ms: 5000 });
             }
             if status == 401 || status == 403 {
-                return Err(crate::error::SigmaError::LlmAuth(text));
+                return Err(crate::error::SigmaError::LlmAuth(msg));
             }
-            return Err(crate::error::SigmaError::Llm(text));
+            return Err(crate::error::SigmaError::Llm(msg));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -188,8 +195,13 @@ impl LlmProvider for OpenAiProvider {
             .await?;
 
         if !response.status().is_success() {
+            let status = response.status().as_u16();
             let text = response.text().await.unwrap_or_default();
-            return Err(crate::error::SigmaError::Llm(text));
+            let msg = parse_error_message(&text);
+            if status == 429 {
+                return Err(crate::error::SigmaError::RateLimited { retry_after_ms: 5000 });
+            }
+            return Err(crate::error::SigmaError::Llm(msg));
         }
 
         let stream = response.bytes_stream();
@@ -208,28 +220,6 @@ impl LlmProvider for OpenAiProvider {
                             if let Some(content) = delta.get("content") {
                                 if let Some(text) = content.as_str() {
                                     return Ok(LlmEvent::ContentDelta(text.to_string()));
-                                }
-                            }
-                            if let Some(tool_calls) = delta.get("tool_calls") {
-                                if let Some(arr) = tool_calls.as_array() {
-                                    for tc in arr {
-                                        let id = tc["id"].as_str().unwrap_or("");
-                                        let name = tc["function"]["name"].as_str().unwrap_or("");
-                                        let args = tc["function"]["arguments"].as_str().unwrap_or("");
-
-                                        if !id.is_empty() && !name.is_empty() {
-                                            return Ok(LlmEvent::ToolUseStart {
-                                                id: id.to_string(),
-                                                name: name.to_string(),
-                                            });
-                                        }
-                                        if !args.is_empty() {
-                                            return Ok(LlmEvent::ToolUseDelta {
-                                                id: id.to_string(),
-                                                arguments_delta: args.to_string(),
-                                            });
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -373,7 +363,8 @@ impl LlmProvider for AnthropicProvider {
 
         if !response.status().is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(crate::error::SigmaError::Llm(text));
+            let msg = parse_error_message(&text);
+            return Err(crate::error::SigmaError::Llm(msg));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -461,7 +452,8 @@ impl LlmProvider for AnthropicProvider {
 
         if !response.status().is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(crate::error::SigmaError::Llm(text));
+            let msg = parse_error_message(&text);
+            return Err(crate::error::SigmaError::Llm(msg));
         }
 
         let stream = response.bytes_stream();
@@ -572,7 +564,8 @@ impl LlmProvider for OllamaProvider {
 
         if !response.status().is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(crate::error::SigmaError::Llm(text));
+            let msg = parse_error_message(&text);
+            return Err(crate::error::SigmaError::Llm(msg));
         }
 
         let json: serde_json::Value = response.json().await?;
@@ -616,7 +609,8 @@ impl LlmProvider for OllamaProvider {
 
         if !response.status().is_success() {
             let text = response.text().await.unwrap_or_default();
-            return Err(crate::error::SigmaError::Llm(text));
+            let msg = parse_error_message(&text);
+            return Err(crate::error::SigmaError::Llm(msg));
         }
 
         let stream = response.bytes_stream();
@@ -664,7 +658,6 @@ pub fn create_provider(config: &ProviderConfig) -> Box<dyn LlmProvider> {
             ))
         }
         ProviderConfig::Gemini { api_key, model } => {
-            // Gemini uses OpenAI-compatible endpoint
             Box::new(OpenAiProvider::new(
                 api_key.clone(),
                 "https://generativelanguage.googleapis.com/v1beta/openai".into(),
