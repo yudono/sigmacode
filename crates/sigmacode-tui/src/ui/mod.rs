@@ -203,7 +203,12 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
-    let paragraph = Paragraph::new(lines);
+    let effective_scroll = if app.follow {
+        u16::MAX
+    } else {
+        app.scroll_offset as u16
+    };
+    let paragraph = Paragraph::new(lines).scroll((effective_scroll, 0));
     f.render_widget(paragraph, area);
 }
 
@@ -353,6 +358,41 @@ fn render_setup(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Rgb(200, 200, 200)),
             )));
         }
+        SetupStep::Workspace => {
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "~".into());
+            lines.push(Line::from(vec![
+                Span::styled("  Base URL: ", Style::default().fg(DIM)),
+                Span::styled(
+                    app.setup.base_url.clone(),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Enter workspace path (or press Enter for current dir):",
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  Default: {}", cwd),
+                Style::default().fg(DIM),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  The agent will read/write files here",
+                Style::default().fg(DIM),
+            )));
+            lines.push(Line::from(""));
+            let input_display = if app.input.is_empty() {
+                "  (press Enter to skip)".to_string()
+            } else {
+                format!("  {}", app.input)
+            };
+            lines.push(Line::from(Span::styled(
+                input_display,
+                Style::default().fg(Color::Rgb(200, 200, 200)),
+            )));
+        }
         SetupStep::Done => {}
     }
 
@@ -372,13 +412,53 @@ fn render_logs(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
+    let dropdown_visible = !app.cmd_choices.is_empty();
+    let dropdown_height = if dropdown_visible {
+        (8.min(app.cmd_choices.len()) as u16) + 2 // +2 for borders
+    } else {
+        0
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Input box
-            Constraint::Length(1), // Model info
+            Constraint::Length(dropdown_height), // autocomplete dropdown
+            Constraint::Length(3),               // Input box
+            Constraint::Length(1),               // Model info
         ])
         .split(area);
+
+    // Command autocomplete dropdown
+    if dropdown_visible {
+        let max_visible = 8.min(app.cmd_choices.len());
+        let items: Vec<Line<'static>> = app.cmd_choices.iter().enumerate().take(max_visible).map(|(i, cmd)| {
+            let style = if i == app.cmd_selected {
+                Style::default().fg(Color::Black).bg(BRAND).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(vec![
+                Span::styled(format!("  {:12}", cmd.name), style),
+                Span::styled(
+                    cmd.desc.to_string(),
+                    if i == app.cmd_selected {
+                        Style::default().fg(Color::Black).bg(BRAND)
+                    } else {
+                        Style::default().fg(DIM)
+                    },
+                ),
+            ])
+        }).collect();
+
+        let dropdown = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BRAND))
+            .bg(Color::Rgb(30, 30, 35))
+            .title(" Commands ");
+
+        let list = Paragraph::new(items).block(dropdown);
+        f.render_widget(list, chunks[0]);
+    }
 
     // Input box
     let border_color = match app.state {
@@ -407,7 +487,22 @@ fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
                 String::new()
             }
         }
-        AppState::Running => "...".to_string(),
+        AppState::Running => {
+            let cursor = if app.tick_count % 20 < 10 { "▏" } else { " " };
+            if !app.input.is_empty() {
+                let q = if !app.queue.is_empty() {
+                    format!(" [{} queued]", app.queue.len())
+                } else {
+                    String::new()
+                };
+                format!("{}{}{}", app.input, cursor, q)
+            } else if !app.queue.is_empty() {
+                let cursor = if app.tick_count % 20 < 10 { "▏" } else { " " };
+                format!("{}[{} queued]", cursor, app.queue.len())
+            } else {
+                "...".to_string()
+            }
+        }
         _ => String::new(),
     };
 
@@ -419,7 +514,7 @@ fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
     let input = Paragraph::new(input_content)
         .style(Style::default().fg(Color::White))
         .block(block);
-    f.render_widget(input, chunks[0]);
+    f.render_widget(input, chunks[1]);
 
     // Model info line
     let model_info = Line::from(vec![
@@ -437,7 +532,7 @@ fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(DIM),
         ),
     ]);
-    f.render_widget(Paragraph::new(model_info), chunks[1]);
+    f.render_widget(Paragraph::new(model_info), chunks[2]);
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -490,6 +585,11 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .split(inner);
 
     // Context header
+    let status_text = if !app.queue.is_empty() {
+        format!("  {} queued", app.queue.len())
+    } else {
+        "  No active task".to_string()
+    };
     let title = Paragraph::new(vec![
         Line::from(Span::styled(
             " Context",
@@ -498,10 +598,7 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "  No active task",
-            Style::default().fg(DIM),
-        )),
+        Line::from(Span::styled(status_text, Style::default().fg(DIM))),
     ]);
     f.render_widget(title, chunks[0]);
 
@@ -578,14 +675,22 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(gs, chunks[3]);
 
     // Path
-    let cwd = std::env::current_dir()
-        .map(|p| {
+    let cwd = app.sigma_config.workspace.as_ref()
+        .map(|w| {
             let home = dirs::home_dir()
-                .map(|h| p.display().to_string().replace(&h.display().to_string(), "~"))
-                .unwrap_or_else(|| p.display().to_string());
+                .map(|h| w.replace(&h.display().to_string(), "~"))
+                .unwrap_or_else(|| w.clone());
             home
         })
-        .unwrap_or_else(|_| "~".into());
+        .or_else(|| {
+            std::env::current_dir().ok().map(|p| {
+                let home = dirs::home_dir()
+                    .map(|h| p.display().to_string().replace(&h.display().to_string(), "~"))
+                    .unwrap_or_else(|| p.display().to_string());
+                home
+            })
+        })
+        .unwrap_or_else(|| "~".into());
 
     let short_path: String = if cwd.len() > 22 {
         format!("...{}", &cwd[cwd.len() - 19..])

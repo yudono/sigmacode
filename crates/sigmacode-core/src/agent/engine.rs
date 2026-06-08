@@ -251,11 +251,45 @@ After executing, respond with a brief summary of what was done."#,
                 }
 
                 // ── Execute Tools ──
+                let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<String>(64);
                 let tool_context = ToolContext {
                     workspace: state.workspace.clone(),
                     state: state.clone(),
                     signal: cancel.clone(),
+                    output_tx: Some(output_tx),
                 };
+
+                // Forward tool output lines as events
+                let forward_tx = event_tx.clone();
+                let forward_handle = tokio::spawn(async move {
+                    while let Some(line) = output_rx.recv().await {
+                        if let Some(ref tx) = forward_tx {
+                            let _ = tx.send(AgentEvent::ToolOutput {
+                                tool_call_id: String::new(),
+                                line,
+                            });
+                        }
+                    }
+                });
+
+                // Send ToolCallStarted for each text-parsed tool call
+                for tc in &tool_calls {
+                    let args_summary = if tc.arguments.is_object() {
+                        let args: Vec<String> = tc.arguments
+                            .as_object()
+                            .unwrap()
+                            .iter()
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect();
+                        if args.is_empty() { "...".into() } else { args.join(", ") }
+                    } else {
+                        "...".into()
+                    };
+                    send_event(AgentEvent::ToolCallStarted {
+                        tool_name: tc.name.clone(),
+                        args_summary,
+                    });
+                }
 
                 for tc in &tool_calls {
                     if cancel.is_cancelled() {
@@ -301,6 +335,9 @@ After executing, respond with a brief summary of what was done."#,
                         content: tool_result.content,
                     });
                 }
+
+                // Wait for output forwarding to complete
+                let _ = forward_handle.await;
             }
         }
 
@@ -310,19 +347,19 @@ After executing, respond with a brief summary of what was done."#,
             .iter()
             .map(|r| {
                 format!(
-                    "{}: {}",
+                    "  {} {}",
+                    if r.success { "✓" } else { "✗" },
                     r.task_type,
-                    if r.success { "✓" } else { "✗" }
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
 
-        let final_summary = format!(
-            "Task completed.\n\nPlan: {}\n\nResults:\n{}",
-            state.plan.as_ref().map(|p| p.goal.as_str()).unwrap_or(""),
+        let final_summary = if summary.is_empty() {
+            "Done.".to_string()
+        } else {
             summary
-        );
+        };
 
         send_event(AgentEvent::Done {
             summary: final_summary.clone(),
@@ -336,7 +373,7 @@ fn parse_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
     let mut tool_calls = Vec::new();
 
     if let Some(start) = text.find("```tool_call") {
-        let content_start = start + 11;
+        let content_start = start + 12; // "```tool_call" is 12 chars
         if let Some(end) = text[content_start..].find("```") {
             let json_str = text[content_start..content_start + end].trim();
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
@@ -388,5 +425,55 @@ fn detect_tool_type(task: &str) -> String {
         "glob".to_string()
     } else {
         "bash".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_tool_call_from_text() {
+        let text = r#"I'll list the files for you.
+
+```tool_call
+{"tool": "bash", "args": {"command": "ls -la"}}
+```
+"#;
+        let calls = parse_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_parse_json_fallback() {
+        let text = r#"Here's the tool call:
+
+```json
+{"tool": "read_file", "args": {"path": "src/main.rs"}}
+```
+"#;
+        let calls = parse_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_no_tool_call() {
+        let text = "This is just regular assistant text with no tool calls.";
+        let calls = parse_tool_calls_from_text(text);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_detect_tool_type() {
+        assert_eq!(detect_tool_type("create a new file"), "write_file");
+        assert_eq!(detect_tool_type("read the config"), "read_file");
+        assert_eq!(detect_tool_type("edit line 42"), "edit_file");
+        assert_eq!(detect_tool_type("search for pattern"), "grep");
+        assert_eq!(detect_tool_type("list all files"), "glob");
+        assert_eq!(detect_tool_type("run cargo build"), "bash");
     }
 }

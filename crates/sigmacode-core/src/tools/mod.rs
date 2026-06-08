@@ -13,7 +13,6 @@ pub use read_file::ReadFileTool;
 pub use write_file::WriteFileTool;
 
 use async_trait::async_trait;
-use std::path::PathBuf;
 
 use crate::error::Result;
 use crate::types::{AgentState, ToolDefinition, ToolResult};
@@ -26,9 +25,10 @@ pub enum PermissionLevel {
 }
 
 pub struct ToolContext {
-    pub workspace: PathBuf,
+    pub workspace: std::path::PathBuf,
     pub state: AgentState,
     pub signal: tokio_util::sync::CancellationToken,
+    pub output_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 #[async_trait]

@@ -26,16 +26,21 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     };
 
-    let (provider_config, model, api_key, base_url) = load_sigma_config()?;
+    let (provider_config, model, api_key, base_url, config_workspace) = load_sigma_config()?;
 
     eprintln!("SigmaCode (headless) - Task: {}", task);
 
     let provider = create_provider(&provider_config);
     let tools = ToolRouter::default();
-    let workspace = std::env::current_dir()?;
+    let workspace = config_workspace.as_ref()
+        .and_then(|w| {
+            let p = std::path::PathBuf::from(w);
+            if p.exists() { Some(p) } else { None }
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let project_name = workspace
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+        .map(|n: &std::ffi::OsStr| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".into());
 
     let context_builder = ContextBuilder::new(&project_name);
@@ -80,9 +85,11 @@ struct SigmaConfig {
     api_key: String,
     #[serde(default)]
     base_url: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
-fn load_sigma_config() -> anyhow::Result<(ProviderConfig, String, String, Option<String>)> {
+fn load_sigma_config() -> anyhow::Result<(ProviderConfig, String, String, Option<String>, Option<String>)> {
     let config_path = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
         .join(".sigma")
@@ -125,5 +132,5 @@ fn load_sigma_config() -> anyhow::Result<(ProviderConfig, String, String, Option
         },
     };
 
-    Ok((provider, cfg.model, cfg.api_key, cfg.base_url))
+    Ok((provider, cfg.model, cfg.api_key, cfg.base_url, cfg.workspace))
 }

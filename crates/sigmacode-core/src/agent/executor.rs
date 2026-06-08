@@ -13,6 +13,7 @@ pub async fn execute_task(
         workspace: workspace.to_path_buf(),
         state: state.clone(),
         signal,
+        output_tx: None,
     };
 
     // Parse instruction as tool call arguments

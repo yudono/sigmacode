@@ -245,6 +245,7 @@ mod tool_tests {
                 iteration: 0,
             },
             signal: CancellationToken::new(),
+            output_tx: None,
         }
     }
 

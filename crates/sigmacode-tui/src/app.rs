@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 use sigmacode_core::llm::create_provider;
 use sigmacode_core::tools::ToolRouter;
@@ -23,6 +25,8 @@ pub struct SigmaConfig {
     pub api_key: String,
     #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 impl Default for SigmaConfig {
@@ -32,6 +36,7 @@ impl Default for SigmaConfig {
             model: "gpt-4o".into(),
             api_key: String::new(),
             base_url: None,
+            workspace: None,
         }
     }
 }
@@ -101,6 +106,7 @@ pub struct App {
     pub current_tab: Tab,
     pub logs: Vec<String>,
     pub scroll_offset: usize,
+    pub follow: bool,
     pub tick_count: usize,
     pub token_display: String,
     pub context_usage_pct: u32,
@@ -109,6 +115,31 @@ pub struct App {
     pub permission_pending: Option<PermissionRequest>,
     pub setup: SetupState,
     pub last_task: Option<String>,
+    pub cmd_choices: Vec<CmdChoice>,
+    pub cmd_selected: usize,
+    pub queue: VecDeque<String>,
+    pub pending_tool_call: String,
+}
+
+pub struct CmdChoice {
+    pub name: &'static str,
+    pub desc: &'static str,
+}
+
+pub fn all_commands() -> Vec<CmdChoice> {
+    vec![
+        CmdChoice { name: "/help", desc: "Show available commands" },
+        CmdChoice { name: "/clear", desc: "Clear chat history" },
+        CmdChoice { name: "/memory", desc: "Show token/cost status" },
+        CmdChoice { name: "/resume", desc: "Re-run last task" },
+        CmdChoice { name: "/models", desc: "Switch model" },
+        CmdChoice { name: "/agents", desc: "Show agent info" },
+        CmdChoice { name: "/skills", desc: "List available tools" },
+        CmdChoice { name: "/config", desc: "Show configuration" },
+        CmdChoice { name: "/compact", desc: "Compact context" },
+        CmdChoice { name: "/version", desc: "Show version" },
+        CmdChoice { name: "/quit", desc: "Exit sigmaCode" },
+    ]
 }
 
 #[derive(PartialEq)]
@@ -131,6 +162,7 @@ pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
     pub diff: Option<DiffView>,
+    pub tool_output: bool,
 }
 
 #[derive(PartialEq)]
@@ -187,6 +219,7 @@ pub enum SetupStep {
     Provider,
     ApiKey,
     BaseUrl,
+    Workspace,
     Done,
 }
 
@@ -225,6 +258,7 @@ impl App {
             current_tab: Tab::Chat,
             logs: Vec::new(),
             scroll_offset: 0,
+            follow: true,
             tick_count: 0,
             token_display: "0 tokens".into(),
             context_usage_pct: 0,
@@ -233,6 +267,10 @@ impl App {
             permission_pending: None,
             setup: SetupState::default(),
             last_task: None,
+            cmd_choices: Vec::new(),
+            cmd_selected: 0,
+            queue: VecDeque::new(),
+            pending_tool_call: String::new(),
         })
     }
 
@@ -250,42 +288,96 @@ impl App {
                     self.current_tab = Tab::Chat;
                 }
                 crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                    self.follow = false;
                 }
                 crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                }
-                _ => {}
-            },
-            AppState::Input => match key.code {
-                crossterm::event::KeyCode::Enter => {
-                    if !self.input.trim().is_empty() {
-                        let task = self.input.clone();
-                        self.input.clear();
-                        if task.starts_with('/') {
-                            self.handle_slash_command(&task);
-                        } else {
-                            self.last_task = Some(task.clone());
-                            self.spawn_agent(task);
-                        }
+                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                    if self.scroll_offset == 0 {
+                        self.follow = true;
                     }
                 }
-                crossterm::event::KeyCode::Esc => {
-                    self.state = if self.messages.is_empty() {
-                        AppState::Idle
-                    } else {
-                        AppState::Done
-                    };
-                    self.input.clear();
-                }
-                crossterm::event::KeyCode::Backspace => {
-                    self.input.pop();
-                }
-                crossterm::event::KeyCode::Char(c) => {
-                    self.input.push(c);
-                }
                 _ => {}
             },
+            AppState::Input => {
+                if !self.cmd_choices.is_empty() {
+                    // Command autocomplete mode
+                    match key.code {
+                        crossterm::event::KeyCode::Tab | crossterm::event::KeyCode::Down => {
+                            self.cmd_selected = (self.cmd_selected + 1) % self.cmd_choices.len();
+                        }
+                        crossterm::event::KeyCode::Up => {
+                            if self.cmd_selected == 0 {
+                                self.cmd_selected = self.cmd_choices.len() - 1;
+                            } else {
+                                self.cmd_selected -= 1;
+                            }
+                        }
+                        crossterm::event::KeyCode::Enter => {
+                            if let Some(choice) = self.cmd_choices.get(self.cmd_selected) {
+                                self.input = choice.name.to_string();
+                                self.cmd_choices.clear();
+                                self.cmd_selected = 0;
+                            }
+                        }
+                        crossterm::event::KeyCode::Esc => {
+                            self.cmd_choices.clear();
+                            self.cmd_selected = 0;
+                        }
+                        crossterm::event::KeyCode::Backspace => {
+                            self.input.pop();
+                            self.update_cmd_choices();
+                            if self.input.is_empty() || !self.input.starts_with('/') {
+                                self.cmd_choices.clear();
+                                self.cmd_selected = 0;
+                            }
+                        }
+                        crossterm::event::KeyCode::Char(c) => {
+                            self.input.push(c);
+                            self.update_cmd_choices();
+                            if !self.input.starts_with('/') {
+                                self.cmd_choices.clear();
+                                self.cmd_selected = 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Normal input mode
+                    match key.code {
+                        crossterm::event::KeyCode::Enter => {
+                            if !self.input.trim().is_empty() {
+                                let task = self.input.clone();
+                                self.input.clear();
+                                if task.starts_with('/') {
+                                    self.handle_slash_command(&task);
+                                } else {
+                                    self.last_task = Some(task.clone());
+                                    self.spawn_agent(task);
+                                }
+                            }
+                        }
+                        crossterm::event::KeyCode::Esc => {
+                            self.state = if self.messages.is_empty() {
+                                AppState::Idle
+                            } else {
+                                AppState::Done
+                            };
+                            self.input.clear();
+                        }
+                        crossterm::event::KeyCode::Backspace => {
+                            self.input.pop();
+                        }
+                        crossterm::event::KeyCode::Char(c) => {
+                            self.input.push(c);
+                            if self.input == "/" {
+                                self.update_cmd_choices();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             AppState::Permission => match key.code {
                 crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
                     self.respond_permission(true, false);
@@ -300,8 +392,36 @@ impl App {
                 }
                 _ => {}
             },
-            AppState::Running => {}
+            AppState::Running => match key.code {
+                crossterm::event::KeyCode::Enter => {
+                    if !self.input.trim().is_empty() {
+                        let task = self.input.trim().to_string();
+                        self.input.clear();
+                        if task.starts_with('/') {
+                            self.handle_slash_command(&task);
+                        } else {
+                            self.queue.push_back(task);
+                        }
+                    }
+                }
+                crossterm::event::KeyCode::Backspace => {
+                    self.input.pop();
+                }
+                crossterm::event::KeyCode::Char(c) => {
+                    self.input.push(c);
+                }
+                _ => {}
+            },
         }
+    }
+
+    fn update_cmd_choices(&mut self) {
+        let query = self.input.trim_start_matches('/');
+        self.cmd_choices = all_commands()
+            .into_iter()
+            .filter(|c| c.name[1..].contains(query))
+            .collect();
+        self.cmd_selected = 0;
     }
 
     // ── Setup Wizard ──
@@ -358,6 +478,14 @@ impl App {
                     if !url.is_empty() {
                         self.setup.base_url = url;
                     }
+                    self.setup.step = SetupStep::Workspace;
+                }
+                SetupStep::Workspace => {
+                    let ws = self.input.trim().to_string();
+                    self.input.clear();
+                    if !ws.is_empty() {
+                        self.sigma_config.workspace = Some(ws);
+                    }
                     self.setup.step = SetupStep::Done;
                     self.finish_setup();
                 }
@@ -383,6 +511,7 @@ impl App {
             } else {
                 Some(self.setup.base_url.clone())
             },
+            workspace: self.sigma_config.workspace.clone(),
         };
 
         let _ = save_sigma_config(&self.sigma_config);
@@ -395,6 +524,7 @@ impl App {
                 self.sigma_config.provider, self.sigma_config.model
             ),
             diff: None,
+        tool_output: false,
         });
 
         self.state = AppState::Idle;
@@ -441,11 +571,13 @@ impl App {
             role: MessageRole::User,
             content: input.to_string(),
             diff: None,
+        tool_output: false,
         });
         self.messages.push(ChatMessage {
             role: MessageRole::Assistant,
             content: response,
             diff: None,
+        tool_output: false,
         });
     }
 
@@ -531,11 +663,13 @@ Use these naturally - the agent decides which tool to use based on your task."#
     }
 
     fn cmd_config(&self) -> String {
+        let workspace = self.sigma_config.workspace.as_deref().unwrap_or("(current dir)");
         format!(
-            "Provider: {}\nModel: {}\nBase URL: {}\nConfig: ~/.sigma/config.yml",
+            "Provider: {}\nModel: {}\nBase URL: {}\nWorkspace: {}\nConfig: ~/.sigma/config.yml",
             self.sigma_config.provider,
             self.sigma_config.model,
-            self.sigma_config.base_url.as_deref().unwrap_or("(default)")
+            self.sigma_config.base_url.as_deref().unwrap_or("(default)"),
+            workspace
         )
     }
 
@@ -578,6 +712,7 @@ Use these naturally - the agent decides which tool to use based on your task."#
             role: MessageRole::User,
             content: task.clone(),
             diff: None,
+        tool_output: false,
         });
 
         self.state = AppState::Running;
@@ -587,7 +722,12 @@ Use these naturally - the agent decides which tool to use based on your task."#
 
         let provider = create_provider(&self.provider_config);
         let tools = ToolRouter::default();
-        let workspace = std::env::current_dir().unwrap_or_default();
+        let workspace = self.sigma_config.workspace.as_ref()
+            .and_then(|w| {
+                let p = std::path::PathBuf::from(w);
+                if p.exists() { Some(p) } else { None }
+            })
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         let project_name = workspace
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -654,6 +794,7 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     role: MessageRole::Tool,
                     content: format!("→ {} {}", task_type, short),
                     diff: None,
+                tool_output: false,
                 });
             }
             AgentEvent::TaskCompleted { success, .. } => {
@@ -664,7 +805,7 @@ Use these naturally - the agent decides which tool to use based on your task."#
             }
             AgentEvent::ToolCallStarted {
                 tool_name,
-                args_summary: _,
+                args_summary,
             } => {
                 self.logs.push(format!("[tool] {}", tool_name));
                 let icon = match tool_name.as_str() {
@@ -676,10 +817,28 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     "grep" => "grep",
                     _ => "tool",
                 };
+                let detail = match tool_name.as_str() {
+                    "bash" => {
+                        // Extract the actual command from "command=..." format
+                        if let Some(cmd) = args_summary.strip_prefix("command=") {
+                            cmd.trim_matches('"').to_string()
+                        } else {
+                            args_summary
+                        }
+                    }
+                    _ => {
+                        if args_summary.is_empty() {
+                            tool_name.clone()
+                        } else {
+                            args_summary
+                        }
+                    }
+                };
                 self.messages.push(ChatMessage {
                     role: MessageRole::Tool,
-                    content: format!("  {} {}", icon, tool_name),
+                    content: format!("  {} {}", icon, detail),
                     diff: None,
+                tool_output: false,
                 });
             }
             AgentEvent::ToolCallCompleted {
@@ -689,6 +848,23 @@ Use these naturally - the agent decides which tool to use based on your task."#
                 self.logs
                     .push(format!("[tool] {} → {}", tool_name, if success { "ok" } else { "err" }));
             }
+            AgentEvent::ToolOutput { tool_call_id: _, line } => {
+                self.logs.push(format!("[output] {}", line));
+                // Append to last assistant message or create a new tool output message
+                if let Some(last) = self.messages.last_mut() {
+                    if last.role == MessageRole::Tool && last.tool_output {
+                        last.content.push('\n');
+                        last.content.push_str(&line);
+                        return;
+                    }
+                }
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Tool,
+                    content: line,
+                    diff: None,
+                    tool_output: true,
+                });
+            }
             AgentEvent::Streaming { token } => {
                 self.total_tokens += token.len() / 4;
                 self.token_display = format_tokens(self.total_tokens);
@@ -696,41 +872,95 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     ((self.total_tokens as f64 / 128_000.0) * 100.0).min(100.0) as u32;
                 self.cost = (self.total_tokens as f64 / 1_000_000.0) * 2.50;
 
-                if let Some(last) = self.messages.last_mut() {
-                    if last.role == MessageRole::Assistant {
-                        last.content.push_str(&token);
-                        if let Some(tc) = extract_tool_call_display(&last.content) {
-                            last.content = last.content[..tc.raw_start].trim_end().to_string();
-                            self.messages.push(ChatMessage {
-                                role: MessageRole::Tool,
-                                content: tc.formatted,
-                                diff: None,
-                            });
+                self.pending_tool_call.push_str(&token);
+
+                // If we're inside a tool_call block, just buffer and wait for it to complete.
+                // ToolCallStarted already displays the tool call, so we discard the raw block.
+                if self.pending_tool_call.contains("```tool_call") || self.pending_tool_call.contains("```json") {
+                    // Find the closing ``` to know when the block is done
+                    let open_marker = if let Some(p) = self.pending_tool_call.find("```tool_call") {
+                        p + 12 // "```tool_call" is 12 chars
+                    } else if let Some(p) = self.pending_tool_call.find("```json") {
+                        p + 7
+                    } else {
+                        0
+                    };
+                    let after_open = &self.pending_tool_call[open_marker..];
+                    if after_open.contains("```") {
+                        // Complete block found — discard it entirely (ToolCallStarted handles display)
+                        self.pending_tool_call.clear();
+                    }
+                    // Don't display anything while inside a tool_call block
+                    return;
+                }
+
+                // Check for partial tool_call markers at end of buffer (split across tokens)
+                // If buffer ends with a prefix of "```tool_call" or "```json", keep buffering
+                let p = &self.pending_tool_call;
+                let might_be_marker = p.ends_with("```tool_call")
+                    || p.ends_with("```tool_cal")
+                    || p.ends_with("```tool_ca")
+                    || p.ends_with("```tool_c")
+                    || p.ends_with("```tool_")
+                    || p.ends_with("```tool")
+                    || p.ends_with("```too")
+                    || p.ends_with("```to")
+                    || p.ends_with("```t")
+                    || p.ends_with("```json")
+                    || p.ends_with("```jso")
+                    || p.ends_with("```js")
+                    || p.ends_with("```j")
+                    || p.ends_with("```\n");
+
+                if might_be_marker {
+                    // Might be entering a tool_call block, buffer and wait for more tokens
+                    return;
+                }
+
+                // Normal text - find the last complete line and flush it
+                if let Some(last_newline) = self.pending_tool_call.rfind('\n') {
+                    let complete = self.pending_tool_call[..last_newline].to_string();
+                    let remaining = self.pending_tool_call[last_newline + 1..].to_string();
+                    self.pending_tool_call = remaining;
+
+                    if !complete.is_empty() {
+                        if let Some(last) = self.messages.last_mut() {
+                            if last.role == MessageRole::Assistant {
+                                if !last.content.is_empty() {
+                                    last.content.push('\n');
+                                }
+                                last.content.push_str(&complete);
+                                return;
+                            }
                         }
-                        return;
+                        self.messages.push(ChatMessage {
+                            role: MessageRole::Assistant,
+                            content: complete,
+                            diff: None,
+                        tool_output: false,
+                        });
                     }
                 }
-                self.messages.push(ChatMessage {
-                    role: MessageRole::Assistant,
-                    content: token,
-                    diff: None,
-                });
             }
             AgentEvent::Error { message } => {
+                self.flush_pending_tool_call();
                 self.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("error: {}", message),
                     diff: None,
+                tool_output: false,
                 });
-                self.state = AppState::Done;
+                self.process_next_in_queue();
             }
             AgentEvent::Done { summary } => {
+                self.flush_pending_tool_call();
                 self.messages.push(ChatMessage {
                     role: MessageRole::Assistant,
                     content: summary,
                     diff: None,
+                tool_output: false,
                 });
-                self.state = AppState::Done;
+                self.process_next_in_queue();
             }
             AgentEvent::PermissionRequest {
                 tool_name,
@@ -755,6 +985,7 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     role: MessageRole::Diff,
                     content: format!("Edit {}", file_path),
                     diff: Some(diff),
+                    tool_output: false,
                 });
             }
             AgentEvent::Thinking { content } => {
@@ -762,9 +993,55 @@ Use these naturally - the agent decides which tool to use based on your task."#
                     role: MessageRole::Thought,
                     content,
                     diff: None,
+                tool_output: false,
                 });
             }
             _ => {}
+        }
+    }
+
+    fn process_next_in_queue(&mut self) {
+        if let Some(task) = self.queue.pop_front() {
+            self.spawn_agent(task);
+        } else {
+            self.state = AppState::Done;
+        }
+    }
+
+    fn flush_pending_tool_call(&mut self) {
+        if self.pending_tool_call.is_empty() {
+            return;
+        }
+        let remaining = self.pending_tool_call.trim().to_string();
+        self.pending_tool_call.clear();
+        if remaining.is_empty() {
+            return;
+        }
+        // If it looks like a partial tool_call, try to parse it anyway
+        if let Some(tc) = extract_tool_call_display(&remaining) {
+            let before = remaining[..tc.raw_start].trim();
+            if !before.is_empty() {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Assistant,
+                    content: before.to_string(),
+                    diff: None,
+                tool_output: false,
+                });
+            }
+            self.messages.push(ChatMessage {
+                role: MessageRole::Tool,
+                content: tc.formatted,
+                diff: None,
+            tool_output: false,
+            });
+        } else {
+            // Plain text
+            self.messages.push(ChatMessage {
+                role: MessageRole::Assistant,
+                content: remaining,
+                diff: None,
+            tool_output: false,
+            });
         }
     }
 
@@ -841,7 +1118,7 @@ struct ToolCallDisplay {
 
 fn extract_tool_call_display(content: &str) -> Option<ToolCallDisplay> {
     if let Some(start) = content.find("```tool_call") {
-        let content_start = start + 11;
+        let content_start = start + 12; // "```tool_call" is 12 chars
         if let Some(end) = content[content_start..].find("```") {
             let json_str = content[content_start..content_start + end].trim();
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {

@@ -266,6 +266,7 @@ pub enum AgentEvent {
     TaskCompleted { task_id: String, success: bool, output: String },
     ToolCallStarted { tool_name: String, args_summary: String },
     ToolCallCompleted { tool_name: String, success: bool },
+    ToolOutput { tool_call_id: String, line: String },
     Streaming { token: String },
     Verifying { command: String },
     Verified { success: bool },
