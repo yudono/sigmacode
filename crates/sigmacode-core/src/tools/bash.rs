@@ -56,6 +56,7 @@ impl Tool for BashTool {
             .arg("-c")
             .arg(command)
             .current_dir(&context.workspace)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
