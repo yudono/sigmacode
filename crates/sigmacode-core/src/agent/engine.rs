@@ -492,7 +492,7 @@ impl Agent {
                                     last_result = Some(result);
                                     break;
                                 }
-                                ExecutionStatus::Paused { next_task_id, .. } => {
+                                ExecutionStatus::Paused { next_task_id: _, .. } => {
                                     last_result = Some(result);
                                     continue;
                                 }
