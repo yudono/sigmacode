@@ -27,6 +27,8 @@ pub struct App {
     pub cost: f64,
     pub total_tokens: usize,
     pub permission_pending: Option<PermissionRequest>,
+    pub setup: SetupState,
+    pub last_task: Option<String>,
 }
 
 #[derive(PartialEq)]
@@ -36,6 +38,7 @@ pub enum AppState {
     Running,
     Done,
     Permission,
+    Setup,
 }
 
 #[derive(PartialEq)]
@@ -87,12 +90,53 @@ pub struct AppConfig {
     pub model: String,
 }
 
+// ── Setup Wizard ──
+
+pub struct SetupState {
+    pub step: SetupStep,
+    pub provider_choice: String,
+    pub api_key: String,
+    pub model: String,
+    pub base_url: String,
+}
+
+#[derive(PartialEq)]
+pub enum SetupStep {
+    Welcome,
+    Provider,
+    ApiKey,
+    BaseUrl,
+    #[allow(dead_code)]
+    Model,
+    Done,
+}
+
+impl Default for SetupState {
+    fn default() -> Self {
+        Self {
+            step: SetupStep::Welcome,
+            provider_choice: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            base_url: String::new(),
+        }
+    }
+}
+
 impl App {
     pub async fn new() -> anyhow::Result<Self> {
+        let needs_setup = !std::path::Path::new(".env").exists()
+            && std::env::var("SIGMACODE_API_KEY").unwrap_or_default().is_empty()
+            && std::env::var("OPENAI_API_KEY").unwrap_or_default().is_empty();
+
         let config = load_config()?;
 
         Ok(Self {
-            state: AppState::Idle,
+            state: if needs_setup {
+                AppState::Setup
+            } else {
+                AppState::Idle
+            },
             input: String::new(),
             messages: Vec::new(),
             agent_handle: None,
@@ -109,11 +153,14 @@ impl App {
             cost: 0.0,
             total_tokens: 0,
             permission_pending: None,
+            setup: SetupState::default(),
+            last_task: None,
         })
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         match self.state {
+            AppState::Setup => self.handle_setup_key(key),
             AppState::Idle | AppState::Done => match key.code {
                 crossterm::event::KeyCode::Char('i') | crossterm::event::KeyCode::Char('I') => {
                     self.state = AppState::Input;
@@ -137,7 +184,12 @@ impl App {
                     if !self.input.trim().is_empty() {
                         let task = self.input.clone();
                         self.input.clear();
-                        self.spawn_agent(task);
+                        if task.starts_with('/') {
+                            self.handle_slash_command(&task);
+                        } else {
+                            self.last_task = Some(task.clone());
+                            self.spawn_agent(task);
+                        }
                     }
                 }
                 crossterm::event::KeyCode::Esc => {
@@ -173,6 +225,346 @@ impl App {
             AppState::Running => {}
         }
     }
+
+    // ── Setup Wizard ──
+
+    fn handle_setup_key(&mut self, key: crossterm::event::KeyEvent) {
+        match key.code {
+            crossterm::event::KeyCode::Enter => match self.setup.step {
+                SetupStep::Welcome => {
+                    self.setup.step = SetupStep::Provider;
+                }
+                SetupStep::Provider => {
+                    let choice = self.input.trim().to_string();
+                    self.input.clear();
+                    match choice.as_str() {
+                        "1" | "openai" => {
+                            self.setup.provider_choice = "openai".into();
+                            self.setup.model = "gpt-4o".into();
+                            self.setup.step = SetupStep::ApiKey;
+                        }
+                        "2" | "anthropic" => {
+                            self.setup.provider_choice = "anthropic".into();
+                            self.setup.model = "claude-sonnet-4-20250514".into();
+                            self.setup.step = SetupStep::ApiKey;
+                        }
+                        "3" | "ollama" => {
+                            self.setup.provider_choice = "ollama".into();
+                            self.setup.model = "llama3".into();
+                            self.setup.step = SetupStep::BaseUrl;
+                        }
+                        "4" | "gemini" => {
+                            self.setup.provider_choice = "gemini".into();
+                            self.setup.model = "gemini-2.0-flash".into();
+                            self.setup.step = SetupStep::ApiKey;
+                        }
+                        "5" | "mimo" => {
+                            self.setup.provider_choice = "openai".into();
+                            self.setup.base_url = "https://api.xiaomimimo.com/v1".into();
+                            self.setup.model = "mimo-v2.5".into();
+                            self.setup.step = SetupStep::ApiKey;
+                        }
+                        _ => {}
+                    }
+                }
+                SetupStep::ApiKey => {
+                    self.setup.api_key = self.input.trim().to_string();
+                    self.input.clear();
+                    self.setup.step = SetupStep::Done;
+                    self.finish_setup();
+                }
+                SetupStep::BaseUrl => {
+                    self.setup.base_url = self.input.trim().to_string();
+                    self.input.clear();
+                    self.setup.step = SetupStep::Done;
+                    self.finish_setup();
+                }
+                SetupStep::Model => {
+                    let m = self.input.trim().to_string();
+                    if !m.is_empty() {
+                        self.setup.model = m;
+                    }
+                    self.input.clear();
+                    self.setup.step = SetupStep::Done;
+                    self.finish_setup();
+                }
+                SetupStep::Done => {}
+            },
+            crossterm::event::KeyCode::Esc => {
+                if self.setup.step == SetupStep::Provider {
+                    self.setup.step = SetupStep::Welcome;
+                } else if self.setup.step == SetupStep::ApiKey || self.setup.step == SetupStep::BaseUrl {
+                    self.setup.step = SetupStep::Provider;
+                }
+            }
+            crossterm::event::KeyCode::Backspace => {
+                self.input.pop();
+            }
+            crossterm::event::KeyCode::Char(c) => {
+                self.input.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_setup(&mut self) {
+        let provider = &self.setup.provider_choice;
+        let model = &self.setup.model;
+        let api_key = &self.setup.api_key;
+        let base_url = &self.setup.base_url;
+
+        let mut env_content = format!(
+            "SIGMACODE_PROVIDER={}\nSIGMACODE_MODEL={}\n",
+            provider, model
+        );
+
+        match provider.as_str() {
+            "openai" => {
+                env_content.push_str(&format!("SIGMACODE_API_KEY={}\n", api_key));
+                if !base_url.is_empty() {
+                    env_content.push_str(&format!("SIGMACODE_BASE_URL={}\n", base_url));
+                }
+            }
+            "anthropic" => {
+                env_content.push_str(&format!("ANTHROPIC_API_KEY={}\n", api_key));
+            }
+            "ollama" => {
+                env_content.push_str(&format!(
+                    "SIGMACODE_BASE_URL={}\n",
+                    if base_url.is_empty() {
+                        "http://localhost:11434"
+                    } else {
+                        base_url
+                    }
+                ));
+            }
+            "gemini" => {
+                env_content.push_str(&format!("SIGMACODE_API_KEY={}\n", api_key));
+                env_content.push_str("SIGMACODE_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai\n");
+            }
+            _ => {}
+        }
+
+        // Save to ~/.config/sigmacode/.env (global)
+        if let Some(home) = dirs::home_dir() {
+            let config_dir = home.join(".config").join("sigmacode");
+            let _ = std::fs::create_dir_all(&config_dir);
+            let _ = std::fs::write(config_dir.join(".env"), &env_content);
+        }
+        // Also save to current directory
+        let _ = std::fs::write(".env", &env_content);
+
+        // Reload config
+        if let Some(home) = dirs::home_dir() {
+            let config_path = home.join(".config").join("sigmacode").join(".env");
+            if config_path.exists() {
+                let _ = dotenvy::from_path(&config_path);
+            }
+        }
+        let _ = dotenvy::dotenv();
+        if let Ok(new_config) = load_config() {
+            self.config = new_config;
+        }
+
+        self.messages.push(ChatMessage {
+            role: MessageRole::System,
+            content: format!(
+                "Setup complete! Provider: {}, Model: {}\nConfig saved to .env",
+                self.setup.provider_choice, self.setup.model
+            ),
+            diff: None,
+        });
+
+        self.state = AppState::Idle;
+    }
+
+    // ── Slash Commands ──
+
+    fn handle_slash_command(&mut self, input: &str) {
+        let parts: Vec<&str> = input.splitn(2, ' ').collect();
+        let cmd = parts[0].to_lowercase();
+        let args = parts.get(1).unwrap_or(&"");
+
+        let response = match cmd.as_str() {
+            "/help" => self.cmd_help(),
+            "/clear" => {
+                self.messages.clear();
+                self.logs.clear();
+                self.total_tokens = 0;
+                self.token_display = "0 tokens".into();
+                self.context_usage_pct = 0;
+                self.cost = 0.0;
+                "Chat cleared.".to_string()
+            }
+            "/memory" => self.cmd_memory(),
+            "/resume" => self.cmd_resume(),
+            "/models" => self.cmd_models(args),
+            "/agents" => self.cmd_agents(),
+            "/skills" => self.cmd_skills(),
+            "/config" => self.cmd_config(),
+            "/compact" => "Context will be compacted on next agent run.".to_string(),
+            "/version" => {
+                format!("sigmaCode v{}", env!("CARGO_PKG_VERSION"))
+            }
+            "/quit" | "/exit" => {
+                self.should_quit = true;
+                return;
+            }
+            _ => {
+                format!("Unknown command: {}. Type /help for available commands.", cmd)
+            }
+        };
+
+        self.messages.push(ChatMessage {
+            role: MessageRole::User,
+            content: input.to_string(),
+            diff: None,
+        });
+        self.messages.push(ChatMessage {
+            role: MessageRole::Assistant,
+            content: response,
+            diff: None,
+        });
+    }
+
+    fn cmd_help(&self) -> String {
+        r#"Available commands:
+
+  /help       Show this help message
+  /clear      Clear chat history and reset tokens
+  /memory     Show working memory status
+  /resume     Re-run the last task
+  /models     Switch model (e.g., /models gpt-4o)
+  /agents     Show agent information
+  /skills     List available tools/skills
+  /config     Show current configuration
+  /compact    Compact context on next run
+  /version    Show version info
+  /quit       Exit sigmaCode
+
+Keyboard shortcuts:
+  i           Enter input mode
+  Esc         Exit input mode / cancel
+  j/k         Scroll down/up
+  l           Switch to logs tab
+  c           Switch to chat tab
+  Ctrl+C      Quit"#
+            .to_string()
+    }
+
+    fn cmd_memory(&self) -> String {
+        format!(
+            "Working memory: {} tokens used\nContext usage: {}%\nTotal tokens: {}\nCost: ${:.4}",
+            self.token_display, self.context_usage_pct, self.total_tokens, self.cost
+        )
+    }
+
+    fn cmd_resume(&mut self) -> String {
+        if let Some(ref task) = self.last_task {
+            let task = task.clone();
+            self.spawn_agent(task);
+            return "Resuming last task...".to_string();
+        }
+        "No previous task to resume.".to_string()
+    }
+
+    fn cmd_models(&mut self, args: &str) -> String {
+        let model = args.trim();
+        if model.is_empty() {
+            return format!(
+                "Current model: {}\n\nUsage: /models <model_name>\n\nExamples:\n  /models gpt-4o\n  /models claude-sonnet-4-20250514\n  /models mimo-v2.5",
+                self.config.model
+            );
+        }
+        self.config.model = model.to_string();
+        let env_content = format!(
+            "SIGMACODE_PROVIDER={}\nSIGMACODE_MODEL={}\nSIGMACODE_API_KEY={}\n",
+            self.provider_name(),
+            model,
+            self.api_key_masked()
+        );
+        // Save to ~/.config/sigmacode/.env
+        if let Some(home) = dirs::home_dir() {
+            let config_dir = home.join(".config").join("sigmacode");
+            let _ = std::fs::create_dir_all(&config_dir);
+            let _ = std::fs::write(config_dir.join(".env"), &env_content);
+        }
+        let _ = std::fs::write(".env", &env_content);
+        format!("Model switched to: {}", model)
+    }
+
+    fn cmd_agents(&self) -> String {
+        format!(
+            "Agent: sigmaCode v{}\nProvider: {}\nModel: {}\nWorkspace: {}",
+            env!("CARGO_PKG_VERSION"),
+            self.provider_name(),
+            self.config.model,
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "?".into())
+        )
+    }
+
+    fn cmd_skills(&self) -> String {
+        r#"Available tools:
+
+  bash        Execute shell commands
+  read_file   Read file contents
+  write_file  Create/overwrite files
+  edit_file   Edit files with string replacement
+  glob        Find files by pattern
+  grep        Search file contents
+
+Use these naturally - the agent decides which tool to use based on your task."#
+            .to_string()
+    }
+
+    fn cmd_config(&self) -> String {
+        format!(
+            "Provider: {}\nModel: {}\nBase URL: {}",
+            self.provider_name(),
+            self.config.model,
+            self.base_url_display()
+        )
+    }
+
+    fn provider_name(&self) -> &str {
+        match &self.config.provider {
+            ProviderConfig::OpenAi { .. } => "openai",
+            ProviderConfig::Anthropic { .. } => "anthropic",
+            ProviderConfig::Ollama { .. } => "ollama",
+            ProviderConfig::Gemini { .. } => "gemini",
+        }
+    }
+
+    fn api_key_masked(&self) -> String {
+        let key = match &self.config.provider {
+            ProviderConfig::OpenAi { api_key, .. } => api_key,
+            ProviderConfig::Anthropic { api_key, .. } => api_key,
+            ProviderConfig::Gemini { api_key, .. } => api_key,
+            _ => return String::new(),
+        };
+        if key.len() > 8 {
+            format!("{}...{}", &key[..4], &key[key.len() - 4..])
+        } else {
+            "****".into()
+        }
+    }
+
+    fn base_url_display(&self) -> &str {
+        match &self.config.provider {
+            ProviderConfig::OpenAi { base_url, .. } => {
+                base_url.as_deref().unwrap_or("https://api.openai.com/v1")
+            }
+            ProviderConfig::Ollama { base_url, .. } => {
+                base_url.as_deref().unwrap_or("http://localhost:11434")
+            }
+            ProviderConfig::Anthropic { .. } => "https://api.anthropic.com",
+            ProviderConfig::Gemini { .. } => "https://generativelanguage.googleapis.com",
+        }
+    }
+
+    // ── Agent ──
 
     fn respond_permission(&mut self, allow: bool, always: bool) {
         if let Some(_req) = self.permission_pending.take() {
@@ -329,15 +721,11 @@ impl App {
                     ((self.total_tokens as f64 / 128_000.0) * 100.0).min(100.0) as u32;
                 self.cost = (self.total_tokens as f64 / 1_000_000.0) * 2.50;
 
-                // Accumulate content and detect tool_call blocks
                 if let Some(last) = self.messages.last_mut() {
                     if last.role == MessageRole::Assistant {
                         last.content.push_str(&token);
-                        // Check for complete tool_call block
                         if let Some(tc) = extract_tool_call_display(&last.content) {
-                            // Remove raw block from assistant content
                             last.content = last.content[..tc.raw_start].trim_end().to_string();
-                            // Add formatted tool call message
                             self.messages.push(ChatMessage {
                                 role: MessageRole::Tool,
                                 content: tc.formatted,
@@ -465,7 +853,6 @@ struct ToolCallDisplay {
 }
 
 fn extract_tool_call_display(content: &str) -> Option<ToolCallDisplay> {
-    // Look for ```tool_call ... ``` blocks
     if let Some(start) = content.find("```tool_call") {
         let content_start = start + 11;
         if let Some(end) = content[content_start..].find("```") {
@@ -483,7 +870,6 @@ fn extract_tool_call_display(content: &str) -> Option<ToolCallDisplay> {
         }
     }
 
-    // Also look for ```json ... ``` blocks with tool call format
     if let Some(start) = content.find("```json") {
         let content_start = start + 7;
         if let Some(end) = content[content_start..].find("```") {

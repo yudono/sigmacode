@@ -31,7 +31,13 @@ pub fn render(f: &mut Frame, app: &App) {
         .split(main_chunks[0]);
 
     match app.current_tab {
-        Tab::Chat => render_chat(f, app, content_chunks[0]),
+        Tab::Chat => {
+            if app.state == AppState::Setup {
+                render_setup(f, app, content_chunks[0]);
+            } else {
+                render_chat(f, app, content_chunks[0]);
+            }
+        }
         Tab::Logs => render_logs(f, app, content_chunks[0]),
     }
 
@@ -201,6 +207,127 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
+fn render_setup(f: &mut Frame, app: &App, area: Rect) {
+    use crate::app::SetupStep;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  sigmaCode Setup",
+            Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    match app.setup.step {
+        SetupStep::Welcome => {
+            lines.push(Line::from(Span::styled(
+                "  Welcome to sigmaCode!",
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Let's set up your AI coding assistant.",
+                Style::default().fg(DIM),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Press Enter to continue...",
+                Style::default().fg(DIM),
+            )));
+        }
+        SetupStep::Provider => {
+            lines.push(Line::from(Span::styled(
+                "  Choose your AI provider:",
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  1. ", Style::default().fg(BRAND)),
+                Span::styled("OpenAI", Style::default().fg(Color::White)),
+                Span::styled(" (gpt-4o, gpt-4.1)", Style::default().fg(DIM)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  2. ", Style::default().fg(BRAND)),
+                Span::styled("Anthropic", Style::default().fg(Color::White)),
+                Span::styled(" (claude-sonnet-4)", Style::default().fg(DIM)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  3. ", Style::default().fg(BRAND)),
+                Span::styled("Ollama", Style::default().fg(Color::White)),
+                Span::styled(" (local models)", Style::default().fg(DIM)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  4. ", Style::default().fg(BRAND)),
+                Span::styled("Gemini", Style::default().fg(Color::White)),
+                Span::styled(" (gemini-2.0-flash)", Style::default().fg(DIM)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  5. ", Style::default().fg(BRAND)),
+                Span::styled("MiMo", Style::default().fg(Color::White)),
+                Span::styled(" (mimo-v2.5)", Style::default().fg(DIM)),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Type 1-5 or provider name, then Enter",
+                Style::default().fg(DIM),
+            )));
+        }
+        SetupStep::ApiKey => {
+            let provider_display = match app.setup.provider_choice.as_str() {
+                "openai" => "OpenAI".to_string(),
+                "anthropic" => "Anthropic".to_string(),
+                "gemini" => "Gemini".to_string(),
+                other => other.to_string(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  Provider: ", Style::default().fg(DIM)),
+                Span::styled(
+                    provider_display,
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Enter your API key:",
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(""));
+            // Show masked input
+            let masked = if app.input.is_empty() {
+                "  (waiting for input...)".to_string()
+            } else {
+                format!("  {}{}", "*".repeat(app.input.len().min(20)), if app.input.len() > 20 { "..." } else { "" })
+            };
+            lines.push(Line::from(Span::styled(
+                masked,
+                Style::default().fg(DIM),
+            )));
+        }
+        SetupStep::BaseUrl => {
+            lines.push(Line::from(Span::styled(
+                "  Enter Ollama base URL (or press Enter for default):",
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  Default: http://localhost:11434",
+                Style::default().fg(DIM),
+            )));
+        }
+        SetupStep::Model => {
+            lines.push(Line::from(Span::styled(
+                "  Enter model name:",
+                Style::default().fg(Color::White),
+            )));
+        }
+        SetupStep::Done => {}
+    }
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, area);
+}
+
 fn render_logs(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for log in app.logs.iter().rev().take(area.height as usize) {
@@ -225,11 +352,16 @@ fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
     let border_color = match app.state {
         AppState::Input => BRAND,
         AppState::Permission => RED,
+        AppState::Setup => ACCENT,
         _ => DIM,
     };
 
     let input_content = match app.state {
         AppState::Input => {
+            let cursor = if app.tick_count % 20 < 10 { "▏" } else { " " };
+            format!("{}{}", app.input, cursor)
+        }
+        AppState::Setup => {
             let cursor = if app.tick_count % 20 < 10 { "▏" } else { " " };
             format!("{}{}", app.input, cursor)
         }
@@ -288,6 +420,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         AppState::Running => " ctrl+c interrupt",
         AppState::Done => " i new task",
         AppState::Permission => " y allow · a always · n reject",
+        AppState::Setup => " enter confirm · esc back",
     };
 
     f.render_widget(
