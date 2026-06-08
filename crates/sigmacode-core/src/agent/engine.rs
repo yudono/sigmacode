@@ -206,7 +206,10 @@ impl ExecuteTask {
             task.task_type, task.instruction,
         );
 
-        let mut messages = vec![Message::System { content: sys }];
+        let mut messages = vec![
+            Message::System { content: sys },
+            Message::User { content: task.instruction.clone() },
+        ];
 
         let options = CompletionOptions {
             temperature: Some(0.0),
@@ -223,25 +226,33 @@ impl ExecuteTask {
                 return "Error: max iterations exceeded".into();
             }
 
-            let mut stream = match self
-                .provider
-                .complete_stream(&messages, tool_defs, &options)
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => return format!("Error: {}", e),
+            let mut stream = match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                self.provider.complete_stream(&messages, tool_defs, &options),
+            ).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return format!("Error: {}", e),
+                Err(_) => return "Error: LLM request timed out (120s)".into(),
             };
 
             let mut assistant_content = String::new();
-            while let Some(event) = stream.next().await {
+            loop {
+                let event = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    stream.next(),
+                ).await;
+
                 match event {
-                    Ok(LlmEvent::ContentDelta(t)) => {
+                    Ok(Some(Ok(LlmEvent::ContentDelta(t)))) => {
                         assistant_content.push_str(&t);
                         let _ = self.event_tx.send(AgentEvent::Streaming { token: t });
                     }
-                    Ok(LlmEvent::Done { .. }) => break,
-                    Ok(LlmEvent::Error(e)) => return format!("Error: {}", e),
-                    _ => {}
+                    Ok(Some(Ok(LlmEvent::Done { .. }))) => break,
+                    Ok(Some(Ok(LlmEvent::Error(e)))) => return format!("Error: {}", e),
+                    Ok(Some(Ok(_))) => {}
+                    Ok(None) => break,
+                    Err(_) => break,
+                    Ok(Some(Err(e))) => return format!("Error: {}", e),
                 }
             }
 
@@ -258,23 +269,6 @@ impl ExecuteTask {
 
             let workspace_path = std::path::PathBuf::from(workspace);
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<String>(64);
-            let tool_context = ToolContext {
-                workspace: workspace_path,
-                state: AgentState {
-                    session_id: uuid::Uuid::new_v4(),
-                    task: task.instruction.clone(),
-                    messages: messages.clone(),
-                    plan: None,
-                    results: vec![],
-                    working_memory: WorkingMemory::new(10_000),
-                    workspace: std::path::PathBuf::from(workspace),
-                    config: AgentConfig::default(),
-                    iteration: 0,
-                    event_tx: None,
-                },
-                signal: CancellationToken::new(),
-                output_tx: Some(output_tx),
-            };
 
             let forward_tx = self.event_tx.clone();
             let forward_handle = tokio::spawn(async move {
@@ -303,6 +297,24 @@ impl ExecuteTask {
                     });
                     continue;
                 }
+
+                let tool_context = ToolContext {
+                    workspace: workspace_path.clone(),
+                    state: AgentState {
+                        session_id: uuid::Uuid::new_v4(),
+                        task: task.instruction.clone(),
+                        messages: messages.clone(),
+                        plan: None,
+                        results: vec![],
+                        working_memory: WorkingMemory::new(10_000),
+                        workspace: workspace_path.clone(),
+                        config: AgentConfig::default(),
+                        iteration: 0,
+                        event_tx: None,
+                    },
+                    signal: CancellationToken::new(),
+                    output_tx: Some(output_tx.clone()),
+                };
 
                 let result = self.tools.execute(&tc.name, tc.arguments.clone(), &tool_context).await;
 
@@ -334,6 +346,7 @@ impl ExecuteTask {
                 });
             }
 
+            drop(output_tx);
             let _ = forward_handle.await;
         }
     }
@@ -429,7 +442,10 @@ impl Agent {
             tools: self.tools.clone(),
             security: self.security.clone(),
             rate_limiter: self.rate_limiter.clone(),
-            event_tx: event_tx.clone().expect("event_tx required for pipeline"),
+            event_tx: event_tx.clone().unwrap_or_else(|| {
+                let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+                tx
+            }),
         };
         let summarize_task = SummarizeTask;
 
@@ -459,12 +475,42 @@ impl Agent {
         session.context.set("tool_defs", tool_defs).await;
         storage.save(session).await.map_err(|e| SigmaError::Other(e.to_string()))?;
 
+        #[allow(unused_assignments)]
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(300),
-            runner.run(&session_id),
+            async {
+                let mut last_result = None;
+                loop {
+                    match runner.run(&session_id).await {
+                        Ok(result) => {
+                            match &result.status {
+                                ExecutionStatus::Completed | ExecutionStatus::WaitingForInput => {
+                                    last_result = Some(result);
+                                    break;
+                                }
+                                ExecutionStatus::Error(_) => {
+                                    last_result = Some(result);
+                                    break;
+                                }
+                                ExecutionStatus::Paused { next_task_id, .. } => {
+                                    last_result = Some(result);
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Err(SigmaError::Other(e.to_string()));
+                        }
+                    }
+                }
+                Ok(last_result.unwrap_or_else(|| graph_flow::ExecutionResult {
+                    response: None,
+                    status: ExecutionStatus::Completed,
+                }))
+            }
         ).await
             .map_err(|_| SigmaError::Llm("Pipeline timed out (300s)".into()))?
-            .map_err(|e| SigmaError::Other(e.to_string()))?;
+            ?;
 
         match result.status {
             ExecutionStatus::Completed => {
