@@ -125,11 +125,11 @@ impl Default for SetupState {
 
 impl App {
     pub async fn new() -> anyhow::Result<Self> {
-        let needs_setup = !std::path::Path::new(".env").exists()
-            && std::env::var("SIGMACODE_API_KEY").unwrap_or_default().is_empty()
-            && std::env::var("OPENAI_API_KEY").unwrap_or_default().is_empty();
-
+        // Load config first
         let config = load_config()?;
+
+        // Determine if setup is needed
+        let needs_setup = needs_setup_wizard(&config);
 
         Ok(Self {
             state: if needs_setup {
@@ -943,9 +943,9 @@ fn load_config() -> anyhow::Result<AppConfig> {
 
     let model = std::env::var("SIGMACODE_MODEL")
         .or_else(|_| std::env::var("OPENAI_MODEL"))
-        .unwrap_or_else(|_| "gpt-4o".into());
+        .unwrap_or_default();
 
-    let provider_type = std::env::var("SIGMACODE_PROVIDER").unwrap_or_else(|_| "openai".into());
+    let provider_type = std::env::var("SIGMACODE_PROVIDER").unwrap_or_default();
 
     let provider = match provider_type.as_str() {
         "anthropic" => {
@@ -959,6 +959,13 @@ fn load_config() -> anyhow::Result<AppConfig> {
             base_url: Some(base_url.clone()),
             model: model.clone(),
         },
+        "gemini" => {
+            let key = std::env::var("SIGMACODE_API_KEY").unwrap_or_default();
+            ProviderConfig::Gemini {
+                api_key: key,
+                model: model.clone(),
+            }
+        }
         _ => ProviderConfig::OpenAi {
             api_key,
             base_url: Some(base_url.clone()),
@@ -967,4 +974,30 @@ fn load_config() -> anyhow::Result<AppConfig> {
     };
 
     Ok(AppConfig { provider, model })
+}
+
+fn needs_setup_wizard(config: &AppConfig) -> bool {
+    // No .env file in current dir or config dir
+    let has_env_file = std::path::Path::new(".env").exists()
+        || dirs::home_dir()
+            .map(|h| h.join(".config").join("sigmacode").join(".env").exists())
+            .unwrap_or(false);
+
+    if has_env_file {
+        return false;
+    }
+
+    // Check if provider has a valid API key
+    match &config.provider {
+        ProviderConfig::OpenAi { api_key, .. } => {
+            api_key.is_empty() || api_key == "your-api-key-here"
+        }
+        ProviderConfig::Anthropic { api_key, .. } => {
+            api_key.is_empty() || api_key == "your-api-key-here"
+        }
+        ProviderConfig::Gemini { api_key, .. } => {
+            api_key.is_empty() || api_key == "your-api-key-here"
+        }
+        ProviderConfig::Ollama { .. } => false, // Ollama doesn't need API key
+    }
 }
