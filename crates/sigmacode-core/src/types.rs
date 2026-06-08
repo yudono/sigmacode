@@ -15,6 +15,7 @@ pub struct AgentState {
     pub workspace: PathBuf,
     pub config: AgentConfig,
     pub iteration: usize,
+    pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

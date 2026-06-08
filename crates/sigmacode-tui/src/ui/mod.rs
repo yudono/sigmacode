@@ -73,7 +73,7 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
                 if msg.tool_output {
                     // Tool output (bash output, file content, etc.) - add highlighting
                     let highlighted = highlight::render_message_with_highlights(&content);
-                    for mut line in highlighted {
+                    for line in highlighted {
                         // Indent tool output
                     let indent = vec![Span::styled("   ", Style::default())];
                     let spans: Vec<Span<'static>> = indent.into_iter().chain(line.spans.into_iter()).collect();

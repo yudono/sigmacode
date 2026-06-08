@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
             mcp_servers: Vec::new(),
         },
         iteration: 0,
+        event_tx: None,
     };
 
     let cancel = tokio_util::sync::CancellationToken::new();

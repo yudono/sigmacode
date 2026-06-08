@@ -12,8 +12,7 @@ use sigmacode_core::ProviderConfig;
 use sigmacode_core::WorkingMemory;
 use tokio::sync::mpsc;
 
-const GREEN: ratatui::style::Color = ratatui::style::Color::Rgb(80, 200, 120);
-const RED: ratatui::style::Color = ratatui::style::Color::Rgb(230, 80, 80);
+
 
 const CONFIG_DIR: &str = ".sigma";
 const CONFIG_FILE: &str = "config.yml";
@@ -760,6 +759,7 @@ Use these naturally - the agent decides which tool to use based on your task."#
                 mcp_servers: Vec::new(),
             },
             iteration: 0,
+            event_tx: None,
         };
 
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -862,7 +862,6 @@ Use these naturally - the agent decides which tool to use based on your task."#
                 self.logs
                     .push(format!("[tool] {} → {}", tool_name, if success { "ok" } else { "err" }));
                 let status_icon = if success { "✓" } else { "✗" };
-                let status_color = if success { GREEN } else { RED };
                 let status_text = if success { "done" } else { "failed" };
                 self.messages.push(ChatMessage {
                     role: MessageRole::Tool,

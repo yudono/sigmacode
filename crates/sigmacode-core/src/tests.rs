@@ -188,6 +188,7 @@ mod context_tests {
             workspace: std::path::PathBuf::from("/tmp/test"),
             config: AgentConfig::default(),
             iteration: 0,
+            event_tx: None,
         }
     }
 
@@ -243,6 +244,7 @@ mod tool_tests {
                 workspace: PathBuf::from(workspace),
                 config: AgentConfig::default(),
                 iteration: 0,
+                event_tx: None,
             },
             signal: CancellationToken::new(),
             output_tx: None,

@@ -38,6 +38,9 @@ pub enum SigmaError {
     #[error("Request error: {0}")]
     Request(#[from] reqwest::Error),
 
+    #[error("Security violation: {0}")]
+    Security(String),
+
     #[error("Task cancelled")]
     Cancelled,
 

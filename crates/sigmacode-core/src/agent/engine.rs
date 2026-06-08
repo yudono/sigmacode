@@ -3,17 +3,371 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::planner::Planner;
 use crate::context::ContextBuilder;
 use crate::error::{Result, SigmaError};
 use crate::llm::LlmProvider;
+use crate::rate_limit::{LlmRateLimiter, RateLimitResult};
+use crate::security::SecurityGuard;
 use crate::tools::{ToolContext, ToolRouter};
 use crate::types::*;
 
+use async_trait::async_trait;
+use graph_flow::{self as gf, Context, ExecutionStatus, FlowRunner, GraphBuilder, GraphError, InMemorySessionStorage, NextAction, Session, SessionStorage, TaskResult as GfTaskResult};
+
+// ── Graph Pipeline Tasks ──
+
+struct SecurityCheckTask {
+    guard: SecurityGuard,
+}
+
+#[async_trait]
+impl gf::Task for SecurityCheckTask {
+    fn id(&self) -> &str { "security_check" }
+
+    async fn run(&self, ctx: Context) -> std::result::Result<GfTaskResult, GraphError> {
+        let task: String = ctx.get("task").await.unwrap_or_default();
+
+        if let Err(e) = self.guard.scan_input(&task) {
+            ctx.set("security_blocked", true).await;
+            ctx.set("security_reason", e.to_string()).await;
+            return Ok(GfTaskResult::new(
+                Some(format!("Security blocked: {}", e)),
+                NextAction::End,
+            ));
+        }
+
+        ctx.set("security_blocked", false).await;
+        Ok(GfTaskResult::new(None, NextAction::Continue))
+    }
+}
+
+struct PlanTask {
+    provider: Arc<dyn LlmProvider>,
+    tool_defs: Vec<ToolDefinition>,
+}
+
+#[async_trait]
+impl gf::Task for PlanTask {
+    fn id(&self) -> &str { "plan" }
+
+    async fn run(&self, ctx: Context) -> std::result::Result<GfTaskResult, GraphError> {
+        let blocked: bool = ctx.get("security_blocked").await.unwrap_or(false);
+        if blocked {
+            let reason: String = ctx.get("security_reason").await.unwrap_or_default();
+            return Ok(GfTaskResult::new(Some(reason), NextAction::End));
+        }
+
+        let task: String = ctx.get("task").await.unwrap_or_default();
+        let _model: String = ctx.get("model").await.unwrap_or_default();
+        let _api_key: String = ctx.get("api_key").await.unwrap_or_default();
+        let _base_url: String = ctx.get("base_url").await.unwrap_or_default();
+
+        let tool_list: Vec<String> = self.tool_defs
+            .iter()
+            .map(|t| format!("- {}: {}", t.name, t.description))
+            .collect();
+
+        let system_prompt = format!(
+            r#"You are a task planner for a coding agent.
+
+Available tools:
+{}
+
+Rules:
+1. Each task should be atomic (one tool call per task)
+2. Tasks should be ordered by dependency
+3. Use specific file paths and commands when possible
+4. If the task is simple, a single task is fine
+
+Respond with a JSON object:
+{{
+  "goal": "brief description",
+  "tasks": [
+    {{
+      "id": "task_1",
+      "task_type": "tool_name",
+      "instruction": "detailed instruction",
+      "depends_on": []
+    }}
+  ]
+}}"#,
+            tool_list.join("\n")
+        );
+
+        let messages = vec![
+            Message::System { content: system_prompt },
+            Message::User { content: task.clone() },
+        ];
+
+        let options = CompletionOptions {
+            temperature: Some(0.0),
+            max_tokens: Some(2048),
+            ..Default::default()
+        };
+
+        let mut stream = self
+            .provider
+            .complete_stream(&messages, &[], &options)
+            .await
+            .map_err(|e| GraphError::TaskExecutionFailed(e.to_string()))?;
+
+        let mut content = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(LlmEvent::ContentDelta(t)) => content.push_str(&t),
+                Ok(LlmEvent::Done { .. }) => break,
+                Ok(LlmEvent::Error(e)) => return Err(GraphError::TaskExecutionFailed(e)),
+                _ => {}
+            }
+        }
+
+        let plan: Plan = serde_json::from_str(&extract_json(&content)).unwrap_or_else(|_| Plan {
+            goal: task.clone(),
+            tasks: vec![crate::types::Task {
+                id: "task_1".into(),
+                task_type: "bash".into(),
+                instruction: task.clone(),
+                depends_on: vec![],
+            }],
+        });
+
+        ctx.set("plan", plan).await;
+        Ok(GfTaskResult::new(Some("Plan created".into()), NextAction::Continue))
+    }
+}
+
+struct ExecuteTask {
+    provider: Arc<dyn LlmProvider>,
+    tools: Arc<ToolRouter>,
+    security: SecurityGuard,
+    rate_limiter: LlmRateLimiter,
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
+}
+
+#[async_trait]
+impl gf::Task for ExecuteTask {
+    fn id(&self) -> &str { "execute" }
+
+    async fn run(&self, ctx: Context) -> std::result::Result<GfTaskResult, GraphError> {
+        let plan: Plan = ctx.get("plan").await.unwrap_or(Plan {
+            goal: String::new(),
+            tasks: vec![],
+        });
+        let workspace: String = ctx.get("workspace").await.unwrap_or_default();
+        let tool_defs: Vec<ToolDefinition> = ctx.get("tool_defs").await.unwrap_or_default();
+
+        let mut all_output = String::new();
+
+        for task in &plan.tasks {
+            let _ = self.event_tx.send(AgentEvent::TaskStarted {
+                task_id: task.id.clone(),
+                task_type: task.task_type.clone(),
+                instruction: task.instruction.clone(),
+            });
+
+            if let RateLimitResult::Limited { retry_after } = self.rate_limiter.check_tool_execution(&task.task_type).await {
+                let _ = self.event_tx.send(AgentEvent::TaskCompleted {
+                    task_id: task.id.clone(),
+                    success: false,
+                    output: format!("Rate limited, retry after {:?}", retry_after),
+                });
+                continue;
+            }
+
+            let output = self.execute_task(task, &tool_defs, &workspace).await;
+
+            let success = !output.starts_with("Error");
+            let _ = self.event_tx.send(AgentEvent::TaskCompleted {
+                task_id: task.id.clone(),
+                success,
+                output: output.clone(),
+            });
+
+            all_output.push_str(&output);
+            all_output.push('\n');
+        }
+
+        Ok(GfTaskResult::new(Some(all_output), NextAction::End))
+    }
+}
+
+impl ExecuteTask {
+    async fn execute_task(
+        &self,
+        task: &crate::types::Task,
+        tool_defs: &[ToolDefinition],
+        workspace: &str,
+    ) -> String {
+        let sys = format!(
+            "You are an agent. Execute this task using tools.\n\
+             Tool: {}\nInstruction: {}\n\
+             Output tool calls as: ```tool_call\n{{\"tool\":\"...\",\"args\":{{...}}}}\n```\n\
+             After executing, respond with a brief summary.",
+            task.task_type, task.instruction,
+        );
+
+        let mut messages = vec![Message::System { content: sys }];
+
+        let options = CompletionOptions {
+            temperature: Some(0.0),
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+
+        let mut iteration = 0;
+        let max_iterations = 10;
+
+        loop {
+            iteration += 1;
+            if iteration > max_iterations {
+                return "Error: max iterations exceeded".into();
+            }
+
+            let mut stream = match self
+                .provider
+                .complete_stream(&messages, tool_defs, &options)
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => return format!("Error: {}", e),
+            };
+
+            let mut assistant_content = String::new();
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(LlmEvent::ContentDelta(t)) => {
+                        assistant_content.push_str(&t);
+                        let _ = self.event_tx.send(AgentEvent::Streaming { token: t });
+                    }
+                    Ok(LlmEvent::Done { .. }) => break,
+                    Ok(LlmEvent::Error(e)) => return format!("Error: {}", e),
+                    _ => {}
+                }
+            }
+
+            let tool_calls = parse_tool_calls_from_text(&assistant_content);
+
+            messages.push(Message::Assistant {
+                content: Some(assistant_content.clone()),
+                tool_calls: tool_calls.clone(),
+            });
+
+            if tool_calls.is_empty() {
+                return assistant_content;
+            }
+
+            let workspace_path = std::path::PathBuf::from(workspace);
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<String>(64);
+            let tool_context = ToolContext {
+                workspace: workspace_path,
+                state: AgentState {
+                    session_id: uuid::Uuid::new_v4(),
+                    task: task.instruction.clone(),
+                    messages: messages.clone(),
+                    plan: None,
+                    results: vec![],
+                    working_memory: WorkingMemory::new(10_000),
+                    workspace: std::path::PathBuf::from(workspace),
+                    config: AgentConfig::default(),
+                    iteration: 0,
+                    event_tx: None,
+                },
+                signal: CancellationToken::new(),
+                output_tx: Some(output_tx),
+            };
+
+            let forward_tx = self.event_tx.clone();
+            let forward_handle = tokio::spawn(async move {
+                while let Some(line) = output_rx.recv().await {
+                    let _ = forward_tx.send(AgentEvent::ToolOutput {
+                        tool_call_id: String::new(),
+                        line,
+                    });
+                }
+            });
+
+            for tc in &tool_calls {
+                let _ = self.event_tx.send(AgentEvent::ToolCallStarted {
+                    tool_name: tc.name.clone(),
+                    args_summary: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                });
+
+                if let Err(e) = self.security.scan_tool_call(&tc.name, &tc.arguments) {
+                    let _ = self.event_tx.send(AgentEvent::ToolCallCompleted {
+                        tool_name: tc.name.clone(),
+                        success: false,
+                    });
+                    messages.push(Message::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: format!("Security blocked: {}", e),
+                    });
+                    continue;
+                }
+
+                let result = self.tools.execute(&tc.name, tc.arguments.clone(), &tool_context).await;
+
+                let tool_result = match result {
+                    Ok(mut r) => {
+                        r.tool_call_id = tc.id.clone();
+                        let _ = self.event_tx.send(AgentEvent::ToolCallCompleted {
+                            tool_name: tc.name.clone(),
+                            success: !r.is_error,
+                        });
+                        r
+                    }
+                    Err(e) => {
+                        let _ = self.event_tx.send(AgentEvent::ToolCallCompleted {
+                            tool_name: tc.name.clone(),
+                            success: false,
+                        });
+                        ToolResult {
+                            tool_call_id: tc.id.clone(),
+                            content: format!("Error: {}", e),
+                            is_error: true,
+                        }
+                    }
+                };
+
+                messages.push(Message::Tool {
+                    tool_call_id: tc.id.clone(),
+                    content: tool_result.content,
+                });
+            }
+
+            let _ = forward_handle.await;
+        }
+    }
+}
+
+struct SummarizeTask;
+
+#[async_trait]
+impl gf::Task for SummarizeTask {
+    fn id(&self) -> &str { "summarize" }
+
+    async fn run(&self, ctx: Context) -> std::result::Result<GfTaskResult, GraphError> {
+        let plan: Plan = ctx.get("plan").await.unwrap_or(Plan {
+            goal: String::new(),
+            tasks: vec![],
+        });
+
+        let summary = plan.tasks.iter().map(|t| format!("  ✓ {}", t.task_type)).collect::<Vec<_>>().join("\n");
+        let final_summary = if summary.is_empty() { "Done.".to_string() } else { summary };
+
+        ctx.set("final_summary", final_summary.clone()).await;
+        Ok(GfTaskResult::new(Some(final_summary), NextAction::End))
+    }
+}
+
+// ── Agent ──
+
 pub struct Agent {
     provider: Arc<dyn LlmProvider>,
-    tools: ToolRouter,
+    tools: Arc<ToolRouter>,
+    #[allow(dead_code)]
     context_builder: ContextBuilder,
+    pub(crate) security: SecurityGuard,
+    pub(crate) rate_limiter: LlmRateLimiter,
 }
 
 impl Agent {
@@ -26,12 +380,116 @@ impl Agent {
         context_builder = context_builder.with_tools(tool_defs);
         Self {
             provider: Arc::from(provider),
-            tools,
+            tools: Arc::new(tools),
             context_builder,
+            security: SecurityGuard::new(),
+            rate_limiter: LlmRateLimiter::new(),
         }
     }
 
+    pub fn with_security(mut self, security: SecurityGuard) -> Self {
+        self.security = security;
+        self
+    }
+
+    pub fn with_rate_limiter(mut self, rate_limiter: LlmRateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
+    pub fn provider(&self) -> Arc<dyn LlmProvider> {
+        self.provider.clone()
+    }
+
     pub async fn run(
+        &self,
+        state: &mut AgentState,
+        _cancel: CancellationToken,
+        event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<String> {
+        let send_event = |event: AgentEvent| {
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(event);
+            }
+        };
+
+        send_event(AgentEvent::Thinking { content: "Creating pipeline...".into() });
+
+        let tool_defs = self.tools.definitions();
+
+        let security_task = SecurityCheckTask {
+            guard: self.security.clone(),
+        };
+        let plan_task = PlanTask {
+            provider: self.provider.clone(),
+            tool_defs: tool_defs.clone(),
+        };
+        let exec_task = ExecuteTask {
+            provider: self.provider.clone(),
+            tools: self.tools.clone(),
+            security: self.security.clone(),
+            rate_limiter: self.rate_limiter.clone(),
+            event_tx: event_tx.clone().expect("event_tx required for pipeline"),
+        };
+        let summarize_task = SummarizeTask;
+
+        let graph = Arc::new(
+            GraphBuilder::new("sigmacode")
+                .add_task(Arc::new(security_task))
+                .add_task(Arc::new(plan_task))
+                .add_task(Arc::new(exec_task))
+                .add_task(Arc::new(summarize_task))
+                .set_start_task("security_check")
+                .add_edge("security_check", "plan")
+                .add_edge("plan", "execute")
+                .add_edge("execute", "summarize")
+                .build(),
+        );
+
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let runner = FlowRunner::new(graph, storage.clone());
+
+        let session_id = format!("session-{}", uuid::Uuid::new_v4());
+        let session = Session::new_from_task(session_id.clone(), "security_check");
+        session.context.set("task", state.task.clone()).await;
+        session.context.set("model", state.config.model.clone()).await;
+        session.context.set("api_key", state.config.api_key.clone()).await;
+        session.context.set("base_url", state.config.base_url.clone()).await;
+        session.context.set("workspace", state.workspace.to_string_lossy().to_string()).await;
+        session.context.set("tool_defs", tool_defs).await;
+        storage.save(session).await.map_err(|e| SigmaError::Other(e.to_string()))?;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            runner.run(&session_id),
+        ).await
+            .map_err(|_| SigmaError::Llm("Pipeline timed out (300s)".into()))?
+            .map_err(|e| SigmaError::Other(e.to_string()))?;
+
+        match result.status {
+            ExecutionStatus::Completed => {
+                let summary = result.response.unwrap_or_default();
+                send_event(AgentEvent::Done { summary: summary.clone() });
+                Ok(summary)
+            }
+            ExecutionStatus::Error(e) => {
+                send_event(AgentEvent::Error { message: e.clone() });
+                Err(SigmaError::Llm(e))
+            }
+            ExecutionStatus::Paused { .. } => {
+                let summary = result.response.unwrap_or_default();
+                send_event(AgentEvent::Done { summary: summary.clone() });
+                Ok(summary)
+            }
+            ExecutionStatus::WaitingForInput => {
+                let summary = result.response.unwrap_or_default();
+                send_event(AgentEvent::Done { summary: summary.clone() });
+                Ok(summary)
+            }
+        }
+    }
+
+    pub async fn run_task(
         &self,
         state: &mut AgentState,
         cancel: CancellationToken,
@@ -43,345 +501,243 @@ impl Agent {
             }
         };
 
-        // ── Step 1: Build system prompt ──
-        let system_prompt = self.context_builder.build_system_prompt(state);
-        state.messages.push(Message::System {
-            content: system_prompt,
-        });
-
-        // ── Step 2: Create plan using LLM ──
-        send_event(AgentEvent::Thinking {
-            content: "Creating plan...".into(),
-        });
-
-        let planner = Planner::new(self.provider.clone());
         let tool_defs = self.tools.definitions();
 
-        let plan = match planner.create_plan(&state.task, &tool_defs).await {
-            Ok(plan) => {
-                send_event(AgentEvent::PlanCreated {
-                    tasks: plan.tasks.clone(),
-                });
-                plan
-            }
-            Err(_) => {
-                // If planning fails, create a simple single-task plan locally (no extra API call)
-                let task_type = detect_tool_type(&state.task);
-                Plan {
-                    goal: state.task.clone(),
-                    tasks: vec![Task {
-                        id: "task_1".into(),
-                        task_type: task_type.clone(),
-                        instruction: state.task.clone(),
-                        depends_on: vec![],
-                    }],
-                }
-            }
-        };
-
-        state.plan = Some(plan.clone());
-
-        // ── Step 3: Execute each task ──
-        for task in plan.tasks.iter() {
+        loop {
             if cancel.is_cancelled() {
                 return Err(SigmaError::Cancelled);
             }
 
-            send_event(AgentEvent::TaskStarted {
-                task_id: task.id.clone(),
-                task_type: task.task_type.clone(),
-                instruction: task.instruction.clone(),
+            state.iteration += 1;
+            if state.iteration >= state.config.max_iterations {
+                return Err(SigmaError::MaxIterations(state.config.max_iterations));
+            }
+
+            let options = CompletionOptions {
+                temperature: Some(state.config.temperature),
+                max_tokens: Some(state.config.max_tokens),
+                ..Default::default()
+            };
+
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                self.provider.complete_stream(&state.messages, &tool_defs, &options),
+            ).await
+                .map_err(|_| SigmaError::Llm("LLM request timed out (120s)".into()))?
+                ?;
+
+            let mut assistant_content = String::new();
+            let mut tool_calls: Vec<ToolCall> = Vec::new();
+            let mut current_tool_call: Option<ToolCall> = None;
+
+            let mut stream = response;
+            loop {
+                let event = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    stream.next(),
+                ).await;
+
+                match event {
+                    Ok(Some(event)) => {
+                        if cancel.is_cancelled() {
+                            return Err(SigmaError::Cancelled);
+                        }
+
+                        match event? {
+                            LlmEvent::ContentDelta(token) => {
+                                assistant_content.push_str(&token);
+                                send_event(AgentEvent::Streaming { token });
+                            }
+                            LlmEvent::ToolUseStart { id: _, name } => {
+                                if let Some(tc) = current_tool_call.take() {
+                                    tool_calls.push(tc);
+                                }
+                                current_tool_call = Some(ToolCall {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    name,
+                                    arguments: serde_json::json!({}),
+                                });
+                            }
+                            LlmEvent::ToolUseDelta {
+                                id: _,
+                                arguments_delta,
+                            } => {
+                                if let Some(ref mut tc) = current_tool_call {
+                                    let existing = tc.arguments.to_string();
+                                    let new_args = format!(
+                                        "{}{}",
+                                        existing.trim_end_matches('}').trim_start_matches('{'),
+                                        arguments_delta
+                                    );
+                                    if let Ok(parsed) =
+                                        serde_json::from_str::<serde_json::Value>(&format!("{{{}}}", new_args))
+                                    {
+                                        tc.arguments = parsed;
+                                    }
+                                }
+                            }
+                            LlmEvent::ToolUseEnd { id: _, name, arguments } => {
+                                if let Some(tc) = current_tool_call.take() {
+                                    tool_calls.push(ToolCall {
+                                        id: tc.id,
+                                        name: tc.name,
+                                        arguments,
+                                    });
+                                } else {
+                                    tool_calls.push(ToolCall {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        name,
+                                        arguments,
+                                    });
+                                }
+                            }
+                            LlmEvent::Done { .. } => break,
+                            LlmEvent::Error(e) => {
+                                send_event(AgentEvent::Error { message: e.clone() });
+                                return Err(SigmaError::Llm(e));
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        send_event(AgentEvent::Error {
+                            message: "LLM stream timed out (60s)".into(),
+                        });
+                        break;
+                    }
+                }
+            }
+
+            if let Some(tc) = current_tool_call.take() {
+                tool_calls.push(tc);
+            }
+
+            if tool_calls.is_empty() && !assistant_content.is_empty() {
+                tool_calls = parse_tool_calls_from_text(&assistant_content);
+            }
+
+            state.messages.push(Message::Assistant {
+                content: if assistant_content.is_empty() {
+                    None
+                } else {
+                    Some(assistant_content.clone())
+                },
+                tool_calls: tool_calls.clone(),
             });
 
-            // Build prompt for this specific task
-            let task_prompt = format!(
-                r#"Execute this task:
-Tool: {}
-Instruction: {}
-Previous results: {}
+            if tool_calls.is_empty() {
+                return Ok(assistant_content);
+            }
 
-Output a tool call like this:
-```tool_call
-{{"tool": "{}", "args": {{...}}}}
-```
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<String>(64);
+            let tool_context = ToolContext {
+                workspace: state.workspace.clone(),
+                state: state.clone(),
+                signal: cancel.clone(),
+                output_tx: Some(output_tx),
+            };
 
-Or if you need to read a file first:
-```tool_call
-{{"tool": "read_file", "args": {{"path": "file.rs"}}}}
-```
-
-After executing, respond with a brief summary of what was done."#,
-                task.task_type,
-                task.instruction,
-                state.results.iter().map(|r| format!("- {}: {}", r.task_type, if r.success { "ok" } else { "failed" })).collect::<Vec<_>>().join("\n"),
-                task.task_type,
-            );
-
-            state.messages.push(Message::User {
-                content: task_prompt,
+            let forward_tx = event_tx.clone();
+            let forward_handle = tokio::spawn(async move {
+                while let Some(line) = output_rx.recv().await {
+                    if let Some(ref tx) = forward_tx {
+                        let _ = tx.send(AgentEvent::ToolOutput {
+                            tool_call_id: String::new(),
+                            line,
+                        });
+                    }
+                }
             });
 
-            // ── ReAct Loop for this task ──
-            let mut sub_iteration = 0;
+            for tc in &tool_calls {
+                let args_summary = if tc.arguments.is_object() {
+                    let args: Vec<String> = tc.arguments
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect();
+                    if args.is_empty() { "...".into() } else { args.join(", ") }
+                } else {
+                    "...".into()
+                };
+                send_event(AgentEvent::ToolCallStarted {
+                    tool_name: tc.name.clone(),
+                    args_summary,
+                });
+            }
 
-            while sub_iteration < 10 {
+            for tc in &tool_calls {
                 if cancel.is_cancelled() {
                     return Err(SigmaError::Cancelled);
                 }
 
-                sub_iteration += 1;
-                state.iteration += 1;
-
-                if state.iteration >= state.config.max_iterations {
-                    return Err(SigmaError::MaxIterations(state.config.max_iterations));
-                }
-
-                let options = CompletionOptions {
-                    temperature: Some(state.config.temperature),
-                    max_tokens: Some(state.config.max_tokens),
-                    ..Default::default()
-                };
-
-                // ── LLM Reasoning ──
-                let response = self
-                    .provider
-                    .complete_stream(&state.messages, &tool_defs, &options)
-                    .await?;
-
-                // Process streaming response
-                let mut assistant_content = String::new();
-                let mut tool_calls: Vec<ToolCall> = Vec::new();
-                let mut current_tool_call: Option<ToolCall> = None;
-
-                let mut stream = response;
-                loop {
-                    let event = tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
-                        stream.next(),
-                    ).await;
-
-                    match event {
-                        Ok(Some(event)) => {
-                    if cancel.is_cancelled() {
-                        return Err(SigmaError::Cancelled);
-                    }
-
-                    match event? {
-                        LlmEvent::ContentDelta(token) => {
-                            assistant_content.push_str(&token);
-                            send_event(AgentEvent::Streaming { token });
-                        }
-                        LlmEvent::ToolUseStart { id: _, name } => {
-                            if let Some(tc) = current_tool_call.take() {
-                                tool_calls.push(tc);
-                            }
-                            current_tool_call = Some(ToolCall {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                name,
-                                arguments: serde_json::json!({}),
-                            });
-                            send_event(AgentEvent::ToolCallStarted {
-                                tool_name: current_tool_call.as_ref().unwrap().name.clone(),
-                                args_summary: "...".into(),
-                            });
-                        }
-                        LlmEvent::ToolUseDelta {
-                            id: _,
-                            arguments_delta,
-                        } => {
-                            if let Some(ref mut tc) = current_tool_call {
-                                let existing = tc.arguments.to_string();
-                                let new_args = format!(
-                                    "{}{}",
-                                    existing.trim_end_matches('}').trim_start_matches('{'),
-                                    arguments_delta
-                                );
-                                if let Ok(parsed) =
-                                    serde_json::from_str::<serde_json::Value>(&format!("{{{}}}", new_args))
-                                {
-                                    tc.arguments = parsed;
-                                }
-                            }
-                        }
-                        LlmEvent::ToolUseEnd { id: _, name, arguments } => {
-                            if let Some(tc) = current_tool_call.take() {
-                                tool_calls.push(ToolCall {
-                                    id: tc.id,
-                                    name: tc.name,
-                                    arguments,
-                                });
-                            } else {
-                                tool_calls.push(ToolCall {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    name,
-                                    arguments,
-                                });
-                            }
-                        }
-                        LlmEvent::Done { .. } => break,
-                        LlmEvent::Error(e) => {
-                            send_event(AgentEvent::Error {
-                                message: e.clone(),
-                            });
-                            return Err(SigmaError::Llm(e));
-                        }
-                    }
-                        }
-                        Ok(None) => break, // stream ended
-                        Err(_) => {
-                            send_event(AgentEvent::Error {
-                                message: "LLM stream timed out (60s)".into(),
-                            });
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(tc) = current_tool_call.take() {
-                    tool_calls.push(tc);
-                }
-
-                // Parse tool calls from text if no native tool calls
-                if tool_calls.is_empty() && !assistant_content.is_empty() {
-                    tool_calls = parse_tool_calls_from_text(&assistant_content);
-                }
-
-                // Add assistant message
-                state.messages.push(Message::Assistant {
-                    content: if assistant_content.is_empty() {
-                        None
-                    } else {
-                        Some(assistant_content.clone())
-                    },
-                    tool_calls: tool_calls.clone(),
-                });
-
-                // If no tool calls, task is done
-                if tool_calls.is_empty() {
-                    send_event(AgentEvent::TaskCompleted {
-                        task_id: task.id.clone(),
-                        success: true,
-                        output: assistant_content,
-                    });
-                    break;
-                }
-
-                // ── Execute Tools ──
-                let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<String>(64);
-                let tool_context = ToolContext {
-                    workspace: state.workspace.clone(),
-                    state: state.clone(),
-                    signal: cancel.clone(),
-                    output_tx: Some(output_tx),
-                };
-
-                // Forward tool output lines as events
-                let forward_tx = event_tx.clone();
-                let forward_handle = tokio::spawn(async move {
-                    while let Some(line) = output_rx.recv().await {
-                        if let Some(ref tx) = forward_tx {
-                            let _ = tx.send(AgentEvent::ToolOutput {
-                                tool_call_id: String::new(),
-                                line,
-                            });
-                        }
-                    }
-                });
-
-                // Send ToolCallStarted for each text-parsed tool call
-                for tc in &tool_calls {
-                    let args_summary = if tc.arguments.is_object() {
-                        let args: Vec<String> = tc.arguments
-                            .as_object()
-                            .unwrap()
-                            .iter()
-                            .map(|(k, v)| format!("{}={}", k, v))
-                            .collect();
-                        if args.is_empty() { "...".into() } else { args.join(", ") }
-                    } else {
-                        "...".into()
-                    };
-                    send_event(AgentEvent::ToolCallStarted {
+                if let Err(e) = self.security.scan_tool_call(&tc.name, &tc.arguments) {
+                    send_event(AgentEvent::ToolCallCompleted {
                         tool_name: tc.name.clone(),
-                        args_summary,
+                        success: false,
                     });
-                }
-
-                for tc in &tool_calls {
-                    if cancel.is_cancelled() {
-                        return Err(SigmaError::Cancelled);
-                    }
-
-                    let result = self
-                        .tools
-                        .execute(&tc.name, tc.arguments.clone(), &tool_context)
-                        .await;
-
-                    let tool_result = match result {
-                        Ok(mut r) => {
-                            r.tool_call_id = tc.id.clone();
-                            send_event(AgentEvent::ToolCallCompleted {
-                                tool_name: tc.name.clone(),
-                                success: !r.is_error,
-                            });
-                            r
-                        }
-                        Err(e) => {
-                            send_event(AgentEvent::ToolCallCompleted {
-                                tool_name: tc.name.clone(),
-                                success: false,
-                            });
-                            ToolResult {
-                                tool_call_id: tc.id.clone(),
-                                content: format!("Error: {}", e),
-                                is_error: true,
-                            }
-                        }
-                    };
-
-                    state.results.push(TaskResult {
-                        task_id: tc.id.clone(),
-                        task_type: tc.name.clone(),
-                        output: tool_result.content.clone(),
-                        success: !tool_result.is_error,
-                    });
-
                     state.messages.push(Message::Tool {
                         tool_call_id: tc.id.clone(),
-                        content: tool_result.content,
+                        content: format!("Security blocked: {}", e),
                     });
+                    continue;
                 }
 
-                // Wait for output forwarding to complete
-                let _ = forward_handle.await;
+                if let RateLimitResult::Limited { retry_after } = self.rate_limiter.check_tool_execution(&tc.name).await {
+                    send_event(AgentEvent::ToolCallCompleted {
+                        tool_name: tc.name.clone(),
+                        success: false,
+                    });
+                    state.messages.push(Message::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content: format!("Rate limited, retry after {:?}", retry_after),
+                    });
+                    continue;
+                }
+
+                let result = self
+                    .tools
+                    .execute(&tc.name, tc.arguments.clone(), &tool_context)
+                    .await;
+
+                let tool_result = match result {
+                    Ok(mut r) => {
+                        r.tool_call_id = tc.id.clone();
+                        send_event(AgentEvent::ToolCallCompleted {
+                            tool_name: tc.name.clone(),
+                            success: !r.is_error,
+                        });
+                        r
+                    }
+                    Err(e) => {
+                        send_event(AgentEvent::ToolCallCompleted {
+                            tool_name: tc.name.clone(),
+                            success: false,
+                        });
+                        ToolResult {
+                            tool_call_id: tc.id.clone(),
+                            content: format!("Error: {}", e),
+                            is_error: true,
+                        }
+                    }
+                };
+
+                state.results.push(TaskResult {
+                    task_id: tc.id.clone(),
+                    task_type: tc.name.clone(),
+                    output: tool_result.content.clone(),
+                    success: !tool_result.is_error,
+                });
+
+                state.messages.push(Message::Tool {
+                    tool_call_id: tc.id.clone(),
+                    content: tool_result.content,
+                });
             }
+
+            let _ = forward_handle.await;
         }
-
-        // ── Step 4: Final summary ──
-        let summary = state
-            .results
-            .iter()
-            .map(|r| {
-                format!(
-                    "  {} {}",
-                    if r.success { "✓" } else { "✗" },
-                    r.task_type,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let final_summary = if summary.is_empty() {
-            "Done.".to_string()
-        } else {
-            summary
-        };
-
-        send_event(AgentEvent::Done {
-            summary: final_summary.clone(),
-        });
-
-        Ok(final_summary)
     }
 }
 
@@ -410,8 +766,6 @@ fn parse_tool_calls_from_text(text: &str) -> Vec<ToolCall> {
         }
     }
 
-    // Also detect raw JSON tool calls without markdown wrappers
-    // e.g. {"tool": "write_file", "args": {"path": "...", ...}}
     if tool_calls.is_empty() {
         let trimmed = text.trim();
         if trimmed.starts_with('{') && trimmed.ends_with('}') {
@@ -438,21 +792,19 @@ fn parse_tool_json(json_str: &str) -> Option<ToolCall> {
     None
 }
 
-fn detect_tool_type(task: &str) -> String {
-    let lower = task.to_lowercase();
-    if lower.contains("create") || lower.contains("write") || lower.contains("add") {
-        "write_file".to_string()
-    } else if lower.contains("read") || lower.contains("show") || lower.contains("cat") {
-        "read_file".to_string()
-    } else if lower.contains("edit") || lower.contains("change") || lower.contains("modify") || lower.contains("fix") {
-        "edit_file".to_string()
-    } else if lower.contains("search") || lower.contains("find") || lower.contains("grep") {
-        "grep".to_string()
-    } else if lower.contains("list") || lower.contains("glob") || lower.contains("files") {
-        "glob".to_string()
-    } else {
-        "bash".to_string()
+fn extract_json(text: &str) -> String {
+    if let Some(start) = text.find("```json") {
+        let json_start = start + 7;
+        if let Some(end) = text[json_start..].find("```") {
+            return text[json_start..json_start + end].trim().to_string();
+        }
     }
+    if let Some(start) = text.find('{') {
+        if let Some(end) = text.rfind('}') {
+            return text[start..=end].to_string();
+        }
+    }
+    text.to_string()
 }
 
 #[cfg(test)]
@@ -465,8 +817,7 @@ mod tests {
 
 ```tool_call
 {"tool": "bash", "args": {"command": "ls -la"}}
-```
-"#;
+```"#;
         let calls = parse_tool_calls_from_text(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "bash");
@@ -479,8 +830,7 @@ mod tests {
 
 ```json
 {"tool": "read_file", "args": {"path": "src/main.rs"}}
-```
-"#;
+```"#;
         let calls = parse_tool_calls_from_text(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_file");
@@ -494,13 +844,4 @@ mod tests {
         assert!(calls.is_empty());
     }
 
-    #[test]
-    fn test_detect_tool_type() {
-        assert_eq!(detect_tool_type("create a new file"), "write_file");
-        assert_eq!(detect_tool_type("read the config"), "read_file");
-        assert_eq!(detect_tool_type("edit line 42"), "edit_file");
-        assert_eq!(detect_tool_type("search for pattern"), "grep");
-        assert_eq!(detect_tool_type("list all files"), "glob");
-        assert_eq!(detect_tool_type("run cargo build"), "bash");
-    }
 }

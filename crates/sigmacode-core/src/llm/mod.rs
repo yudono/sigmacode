@@ -3,6 +3,8 @@ use futures::{Stream, StreamExt};
 use std::pin::Pin;
 
 use crate::error::Result;
+use crate::rate_limit::{LlmRateLimiter, RateLimitResult};
+use crate::security::SecurityGuard;
 use crate::types::{CompletionOptions, CompletionResponse, LlmEvent, Message, TokenUsage, ProviderConfig};
 
 // ── LLM Provider Trait ──
@@ -55,6 +57,8 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     model: String,
+    security: SecurityGuard,
+    rate_limiter: LlmRateLimiter,
 }
 
 impl OpenAiProvider {
@@ -68,7 +72,19 @@ impl OpenAiProvider {
             api_key,
             base_url,
             model,
+            security: SecurityGuard::new(),
+            rate_limiter: LlmRateLimiter::new(),
         }
+    }
+
+    pub fn with_security(mut self, security: SecurityGuard) -> Self {
+        self.security = security;
+        self
+    }
+
+    pub fn with_rate_limiter(mut self, rate_limiter: LlmRateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
     }
 
     fn build_request_body(
@@ -81,24 +97,31 @@ impl OpenAiProvider {
         let msgs: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
-                let mut v = serde_json::to_value(m).unwrap_or_default();
-                if let Some(obj) = v.as_object_mut() {
-                    let role = obj.get("role").and_then(|r| r.as_str()).map(String::from);
-                    let tool_content = if role.as_deref() == Some("tool") {
-                        obj.get("content").and_then(|c| c.as_str()).map(String::from)
-                    } else {
-                        None
-                    };
-                    if role.as_deref() == Some("assistant") {
-                        obj.remove("tool_calls");
+                match m {
+                    Message::Assistant { content, tool_calls } if !tool_calls.is_empty() => {
+                        let mut text = content.clone().unwrap_or_default();
+                        for tc in tool_calls {
+                            let args_str = if let Ok(s) = serde_json::to_string(&tc.arguments) { s } else { "{}".into() };
+                            text.push_str(&format!(
+                                "\n```tool_call\n{{\"tool\": \"{}\", \"args\": {}}}\n```",
+                                tc.name, args_str
+                            ));
+                        }
+                        serde_json::json!({
+                            "role": "assistant",
+                            "content": text,
+                        })
                     }
-                    if let Some(content) = tool_content {
-                        obj.insert("role".into(), serde_json::json!("user"));
-                        obj.insert("content".into(), serde_json::json!(format!("[Tool result]\n{}", content)));
-                        obj.remove("tool_call_id");
+                    Message::Tool { tool_call_id, content } => {
+                        serde_json::json!({
+                            "role": "user",
+                            "content": format!("[Tool result: {}]\n{}", tool_call_id, content),
+                        })
+                    }
+                    _ => {
+                        serde_json::to_value(m).unwrap_or_default()
                     }
                 }
-                v
             })
             .collect();
 
@@ -129,6 +152,12 @@ impl LlmProvider for OpenAiProvider {
         tools: &[crate::types::ToolDefinition],
         options: &CompletionOptions,
     ) -> Result<CompletionResponse> {
+        if let RateLimitResult::Limited { retry_after } = self.rate_limiter.check_llm_request("openai").await {
+            return Err(crate::error::SigmaError::RateLimited {
+                retry_after_ms: retry_after.as_millis() as u64,
+            });
+        }
+
         let body = self.build_request_body(messages, tools, options, false);
 
         let response = self
@@ -197,6 +226,12 @@ impl LlmProvider for OpenAiProvider {
         tools: &[crate::types::ToolDefinition],
         options: &CompletionOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>> {
+        if let RateLimitResult::Limited { retry_after } = self.rate_limiter.check_llm_request("openai").await {
+            return Err(crate::error::SigmaError::RateLimited {
+                retry_after_ms: retry_after.as_millis() as u64,
+            });
+        }
+
         let body = self.build_request_body(messages, tools, options, true);
 
         let response = self
@@ -274,6 +309,8 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     model: String,
+    security: SecurityGuard,
+    rate_limiter: LlmRateLimiter,
 }
 
 impl AnthropicProvider {
@@ -282,7 +319,19 @@ impl AnthropicProvider {
             client: reqwest::Client::new(),
             api_key,
             model,
+            security: SecurityGuard::new(),
+            rate_limiter: LlmRateLimiter::new(),
         }
+    }
+
+    pub fn with_security(mut self, security: SecurityGuard) -> Self {
+        self.security = security;
+        self
+    }
+
+    pub fn with_rate_limiter(mut self, rate_limiter: LlmRateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
     }
 
     fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<serde_json::Value>) {
@@ -350,6 +399,12 @@ impl LlmProvider for AnthropicProvider {
         tools: &[crate::types::ToolDefinition],
         options: &CompletionOptions,
     ) -> Result<CompletionResponse> {
+        if let RateLimitResult::Limited { retry_after } = self.rate_limiter.check_llm_request("anthropic").await {
+            return Err(crate::error::SigmaError::RateLimited {
+                retry_after_ms: retry_after.as_millis() as u64,
+            });
+        }
+
         let (system, msgs) = Self::convert_messages(messages);
 
         let tool_defs: Vec<serde_json::Value> = tools
@@ -438,6 +493,12 @@ impl LlmProvider for AnthropicProvider {
         tools: &[crate::types::ToolDefinition],
         options: &CompletionOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>> {
+        if let RateLimitResult::Limited { retry_after } = self.rate_limiter.check_llm_request("anthropic").await {
+            return Err(crate::error::SigmaError::RateLimited {
+                retry_after_ms: retry_after.as_millis() as u64,
+            });
+        }
+
         let (system, msgs) = Self::convert_messages(messages);
 
         let tool_defs: Vec<serde_json::Value> = tools
@@ -542,6 +603,7 @@ pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
     model: String,
+    rate_limiter: LlmRateLimiter,
 }
 
 impl OllamaProvider {
@@ -550,6 +612,7 @@ impl OllamaProvider {
             client: reqwest::Client::new(),
             base_url,
             model,
+            rate_limiter: LlmRateLimiter::new(),
         }
     }
 }
@@ -566,6 +629,12 @@ impl LlmProvider for OllamaProvider {
         _tools: &[crate::types::ToolDefinition],
         options: &CompletionOptions,
     ) -> Result<CompletionResponse> {
+        if let RateLimitResult::Limited { retry_after } = self.rate_limiter.check_llm_request("ollama").await {
+            return Err(crate::error::SigmaError::RateLimited {
+                retry_after_ms: retry_after.as_millis() as u64,
+            });
+        }
+
         let msgs: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| serde_json::to_value(m).unwrap_or_default())
@@ -611,6 +680,12 @@ impl LlmProvider for OllamaProvider {
         _tools: &[crate::types::ToolDefinition],
         options: &CompletionOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>> {
+        if let RateLimitResult::Limited { retry_after } = self.rate_limiter.check_llm_request("ollama").await {
+            return Err(crate::error::SigmaError::RateLimited {
+                retry_after_ms: retry_after.as_millis() as u64,
+            });
+        }
+
         let msgs: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| serde_json::to_value(m).unwrap_or_default())

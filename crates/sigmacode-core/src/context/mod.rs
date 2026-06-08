@@ -60,7 +60,16 @@ You have access to tools for reading, writing, and editing files, running shell 
 7. Run bash commands to verify changes (npm run build, cargo check, etc.)
 8. Be concise in your responses - focus on the task
 9. Never expose secrets, API keys, or sensitive data
-10. If you're unsure about something, ask the user{}
+10. If you're unsure about something, ask the user
+
+## Tooling Preferences:
+- NEVER use create-react-app (CRA) — it is deprecated and slow
+- For React/Vue/Svelte/TS projects, use `bun create vite` or `npm create vite@latest`
+- For package management, prefer `bun` over `npm` when available (faster installs)
+- For new Node.js projects, prefer `bun init` over `npm init`
+- When scaffolding, always use the latest modern tools (Vite, Turbopack, esbuild)
+- If user explicitly asks for CRA, warn them and suggest Vite instead
+- ALWAYS use `-y` flag with npx (e.g. `npx -y create-vite`) to auto-confirm package installs — without it, npx hangs waiting for user input{}
 "#,
             self.project_name, tools_section
         );
