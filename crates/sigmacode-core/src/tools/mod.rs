@@ -96,6 +96,14 @@ impl ToolRouter {
             .get(name)
             .ok_or_else(|| crate::error::SigmaError::ToolNotFound(name.to_string()))?;
 
+        if let Some(err) = sandbox_check(name, &args, &context.workspace) {
+            return Ok(ToolResult {
+                tool_call_id: String::new(),
+                content: err,
+                is_error: true,
+            });
+        }
+
         tool.execute(args, context).await
     }
 
@@ -110,4 +118,50 @@ impl Default for ToolRouter {
         router.register_defaults();
         router
     }
+}
+
+fn sandbox_check(tool_name: &str, args: &serde_json::Value, workspace: &std::path::Path) -> Option<String> {
+    let path_arg = match tool_name {
+        "read_file" | "write_file" | "edit_file" => args["path"].as_str()?,
+        "bash" => {
+            let cmd = args["command"].as_str()?;
+            if cmd.contains("..") || cmd.contains("~") {
+                return Some(format!(
+                    "Sandbox violation: command '{}' contains path traversal. Workspace: {}",
+                    &cmd[..cmd.len().min(80)],
+                    workspace.display()
+                ));
+            }
+            return None;
+        }
+        _ => return None,
+    };
+
+    let full_path = if std::path::Path::new(path_arg).is_absolute() {
+        std::path::PathBuf::from(path_arg)
+    } else {
+        workspace.join(path_arg)
+    };
+
+    let canonical = full_path.canonicalize().ok();
+    let ws_canonical = workspace.canonicalize().ok();
+
+    match (canonical, ws_canonical) {
+        (Some(c), Some(ws)) => {
+            if !c.starts_with(&ws) {
+                return Some(format!(
+                    "Sandbox violation: {} is outside workspace {}\nOnly files within the workspace can be accessed.",
+                    c.display(),
+                    ws.display()
+                ));
+            }
+        }
+        (Some(c), None) => {
+            // Workspace doesn't exist yet, allow operations (e.g., first file creation)
+            let _ = c;
+        }
+        _ => {}
+    }
+
+    None
 }

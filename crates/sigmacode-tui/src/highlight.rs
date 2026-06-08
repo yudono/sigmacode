@@ -52,12 +52,14 @@ fn looks_like_jsx(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() { return false; }
     if trimmed.starts_with('<') && !trimmed.starts_with("<!--") { return true; }
+    if trimmed.starts_with('{') && trimmed.contains('}') { return true; }
     if trimmed.contains("className=") || trimmed.contains("onClick=") { return true; }
+    if trimmed.contains("viewBox=") || trimmed.contains("fill=\"") { return true; }
     if trimmed.contains("import ") && trimmed.contains("from ") { return true; }
     if trimmed.contains("export ") && (trimmed.contains("function ") || trimmed.contains("default ")) { return true; }
     if trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("function ") { return true; }
     if trimmed.starts_with("return (") || trimmed.starts_with("return(") { return true; }
-    if trimmed.contains("viewBox=") || trimmed.contains("fill=\"") { return true; }
+    if trimmed.contains("useState") || trimmed.contains("useEffect") { return true; }
     false
 }
 
@@ -68,7 +70,10 @@ pub fn render_message_with_highlights(content: &str) -> Vec<Line<'static>> {
     let mut lang = String::new();
     let mut code_lines = Vec::new();
 
-    for line in content.lines() {
+    // Normalize escaped newlines from LLM output
+    let normalized = content.replace("\\n", "\n");
+
+    for line in normalized.lines() {
         if line.starts_with("```") {
             if in_code_block {
                 let highlighted = highlight_code_block(&code_lines.join("\n"), &lang);

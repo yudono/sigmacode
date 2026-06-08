@@ -938,33 +938,44 @@ Use these naturally - the agent decides which tool to use based on your task."#
 
                 // Suppress tool_call text markers from MiMo API
                 if self.in_tool_call_text {
-                    if let Some(end) = self.pending_tool_call.find("}\n") {
-                        let after = &self.pending_tool_call[end + 2..];
-                        self.pending_tool_call = after.to_string();
-                        self.in_tool_call_text = false;
-                    } else if self.pending_tool_call.ends_with('}') {
-                        self.pending_tool_call.clear();
-                        self.in_tool_call_text = false;
-                        return;
-                    } else {
+                    // Count braces to find end of JSON object
+                    let mut depth = 0i32;
+                    let mut ended = false;
+                    for (i, ch) in self.pending_tool_call.char_indices() {
+                        match ch {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    // Found end of JSON — discard everything up to here
+                                    self.pending_tool_call = self.pending_tool_call[i + 1..].to_string();
+                                    self.in_tool_call_text = false;
+                                    ended = true;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !ended {
                         self.pending_tool_call.clear();
                         return;
                     }
                 }
 
-                // Detect tool_call text blocks: "tool_call\n{...}" or just "tool_call"
+                // Detect tool_call text blocks: "tool_call\n{...}" or "tool_call\n"
                 {
                     let pt = self.pending_tool_call.clone();
-                    if let Some(tc_pos) = pt.rfind("tool_call") {
+                    if let Some(tc_pos) = pt.find("tool_call") {
                         let after_tc = &pt[tc_pos + 9..];
-                        if after_tc.starts_with('\n') || after_tc.starts_with('{') || after_tc.is_empty() {
+                        if after_tc.starts_with('{') || after_tc.starts_with('\n') || after_tc.is_empty() {
                             let before = pt[..tc_pos].to_string();
                             self.pending_tool_call = before;
                             if after_tc.starts_with('{') {
                                 self.in_tool_call_text = true;
+                                // Process the opening brace immediately
                             } else if after_tc.starts_with('\n') {
-                                let rest = &after_tc[1..];
-                                self.pending_tool_call = rest.to_string();
+                                self.pending_tool_call = after_tc[1..].to_string();
                             }
                             if self.pending_tool_call.trim().is_empty() {
                                 return;
