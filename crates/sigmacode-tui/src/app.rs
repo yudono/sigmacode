@@ -15,6 +15,7 @@ pub struct App {
     pub messages: Vec<ChatMessage>,
     pub agent_handle: Option<tokio::task::JoinHandle<()>>,
     pub event_rx: Option<mpsc::UnboundedReceiver<AgentEvent>>,
+    pub event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     pub should_quit: bool,
     pub config: AppConfig,
     pub current_tab: Tab,
@@ -24,8 +25,8 @@ pub struct App {
     pub token_display: String,
     pub context_usage_pct: u32,
     pub cost: f64,
-    pub token_usage: String,
     pub total_tokens: usize,
+    pub permission_pending: Option<PermissionRequest>,
 }
 
 #[derive(PartialEq)]
@@ -34,6 +35,7 @@ pub enum AppState {
     Input,
     Running,
     Done,
+    Permission,
 }
 
 #[derive(PartialEq)]
@@ -45,6 +47,7 @@ pub enum Tab {
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
+    pub diff: Option<DiffView>,
 }
 
 #[derive(PartialEq)]
@@ -53,6 +56,28 @@ pub enum MessageRole {
     Assistant,
     System,
     Tool,
+    Thought,
+    Diff,
+}
+
+pub struct DiffView {
+    pub file_path: String,
+    pub old_lines: Vec<DiffLine>,
+    pub new_lines: Vec<DiffLine>,
+}
+
+pub struct DiffLine {
+    pub line_num: usize,
+    pub content: String,
+    pub is_added: bool,
+    pub is_removed: bool,
+}
+
+pub struct PermissionRequest {
+    pub tool_name: String,
+    pub description: String,
+    pub args_summary: String,
+    pub allow_always: bool,
 }
 
 pub struct AppConfig {
@@ -70,6 +95,7 @@ impl App {
             messages: Vec::new(),
             agent_handle: None,
             event_rx: None,
+            event_tx: None,
             should_quit: false,
             config,
             current_tab: Tab::Chat,
@@ -79,18 +105,18 @@ impl App {
             token_display: "0 tokens".into(),
             context_usage_pct: 0,
             cost: 0.0,
-            token_usage: "0".into(),
             total_tokens: 0,
+            permission_pending: None,
         })
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         match self.state {
             AppState::Idle | AppState::Done => match key.code {
-                crossterm::event::KeyCode::Char('i') => {
+                crossterm::event::KeyCode::Char('i') | crossterm::event::KeyCode::Char('I') => {
                     self.state = AppState::Input;
                 }
-                crossterm::event::KeyCode::Char('l') => {
+                crossterm::event::KeyCode::Char('l') | crossterm::event::KeyCode::Char('L') => {
                     self.current_tab = Tab::Logs;
                 }
                 crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Esc => {
@@ -101,12 +127,6 @@ impl App {
                 }
                 crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
                     self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                }
-                crossterm::event::KeyCode::Char('g') => {
-                    self.scroll_offset = usize::MAX;
-                }
-                crossterm::event::KeyCode::Char('G') => {
-                    self.scroll_offset = 0;
                 }
                 _ => {}
             },
@@ -134,7 +154,33 @@ impl App {
                 }
                 _ => {}
             },
+            AppState::Permission => match key.code {
+                crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
+                    self.respond_permission(true, false);
+                }
+                crossterm::event::KeyCode::Char('a') | crossterm::event::KeyCode::Char('A') => {
+                    self.respond_permission(true, true);
+                }
+                crossterm::event::KeyCode::Char('n')
+                | crossterm::event::KeyCode::Char('N')
+                | crossterm::event::KeyCode::Esc => {
+                    self.respond_permission(false, false);
+                }
+                _ => {}
+            },
             AppState::Running => {}
+        }
+    }
+
+    fn respond_permission(&mut self, allow: bool, always: bool) {
+        if let Some(_req) = self.permission_pending.take() {
+            self.state = AppState::Running;
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx.send(AgentEvent::PermissionResponse {
+                    allowed: allow,
+                    always,
+                });
+            }
         }
     }
 
@@ -162,10 +208,12 @@ impl App {
         self.messages.push(ChatMessage {
             role: MessageRole::User,
             content: task.clone(),
+            diff: None,
         });
 
         self.state = AppState::Running;
         self.event_rx = Some(event_rx);
+        self.event_tx = Some(event_tx.clone());
         self.scroll_offset = 0;
 
         let provider = create_provider(&self.config.provider);
@@ -220,10 +268,6 @@ impl App {
         match event {
             AgentEvent::Planning { goal } => {
                 self.logs.push(format!("[plan] {}", goal));
-                self.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: format!("planning: {}", goal),
-                });
             }
             AgentEvent::PlanCreated { tasks } => {
                 self.logs
@@ -234,26 +278,30 @@ impl App {
                 instruction,
                 ..
             } => {
-                self.logs.push(format!("[exec] {}: {}", task_type, instruction));
-                let short: String = instruction.chars().take(60).collect();
+                self.logs
+                    .push(format!("[exec] {}: {}", task_type, instruction));
+                let short: String = instruction.chars().take(80).collect();
                 self.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: format!("{}: {}", task_type, short),
+                    role: MessageRole::Tool,
+                    content: format!("→ {} {}", task_type, short),
+                    diff: None,
                 });
             }
-            AgentEvent::TaskCompleted {
-                success, output: _, ..
-            } => {
+            AgentEvent::TaskCompleted { success, .. } => {
                 self.logs.push(format!(
                     "[done] {}",
                     if success { "ok" } else { "failed" }
                 ));
             }
-            AgentEvent::ToolCallStarted { tool_name, .. } => {
+            AgentEvent::ToolCallStarted {
+                tool_name,
+                args_summary: _,
+            } => {
                 self.logs.push(format!("[tool] {}", tool_name));
                 self.messages.push(ChatMessage {
                     role: MessageRole::Tool,
-                    content: tool_name,
+                    content: format!("◆ {}", tool_name),
+                    diff: None,
                 });
             }
             AgentEvent::ToolCallCompleted {
@@ -266,8 +314,8 @@ impl App {
             AgentEvent::Streaming { token } => {
                 self.total_tokens += token.len() / 4;
                 self.token_display = format_tokens(self.total_tokens);
-                self.token_usage = format_tokens(self.total_tokens);
-                self.context_usage_pct = ((self.total_tokens as f64 / 128_000.0) * 100.0) as u32;
+                self.context_usage_pct =
+                    ((self.total_tokens as f64 / 128_000.0) * 100.0).min(100.0) as u32;
                 self.cost = (self.total_tokens as f64 / 1_000_000.0) * 2.50;
 
                 if let Some(last) = self.messages.last_mut() {
@@ -279,12 +327,14 @@ impl App {
                 self.messages.push(ChatMessage {
                     role: MessageRole::Assistant,
                     content: token,
+                    diff: None,
                 });
             }
             AgentEvent::Error { message } => {
                 self.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("error: {}", message),
+                    diff: None,
                 });
                 self.state = AppState::Done;
             }
@@ -292,8 +342,41 @@ impl App {
                 self.messages.push(ChatMessage {
                     role: MessageRole::Assistant,
                     content: summary,
+                    diff: None,
                 });
                 self.state = AppState::Done;
+            }
+            AgentEvent::PermissionRequest {
+                tool_name,
+                description,
+                args_summary,
+            } => {
+                self.state = AppState::Permission;
+                self.permission_pending = Some(PermissionRequest {
+                    tool_name,
+                    description,
+                    args_summary,
+                    allow_always: false,
+                });
+            }
+            AgentEvent::DiffGenerated {
+                file_path,
+                old_content,
+                new_content,
+            } => {
+                let diff = build_diff_view(&file_path, &old_content, &new_content);
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Diff,
+                    content: format!("Edit {}", file_path),
+                    diff: Some(diff),
+                });
+            }
+            AgentEvent::Thinking { content } => {
+                self.messages.push(ChatMessage {
+                    role: MessageRole::Thought,
+                    content,
+                    diff: None,
+                });
             }
             _ => {}
         }
@@ -312,13 +395,43 @@ impl App {
     }
 }
 
+fn build_diff_view(file_path: &str, old: &str, new: &str) -> DiffView {
+    let old_lines: Vec<DiffLine> = old
+        .lines()
+        .enumerate()
+        .map(|(i, l)| DiffLine {
+            line_num: i + 1,
+            content: l.to_string(),
+            is_added: false,
+            is_removed: false,
+        })
+        .collect();
+
+    let new_lines: Vec<DiffLine> = new
+        .lines()
+        .enumerate()
+        .map(|(i, l)| DiffLine {
+            line_num: i + 1,
+            content: l.to_string(),
+            is_added: !old.lines().any(|ol| ol == l),
+            is_removed: false,
+        })
+        .collect();
+
+    DiffView {
+        file_path: file_path.to_string(),
+        old_lines,
+        new_lines,
+    }
+}
+
 fn format_tokens(n: usize) -> String {
     if n >= 1_000_000 {
-        format!("{:.1}M tokens", n as f64 / 1_000_000.0)
+        format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
-        format!("{:.1}K tokens", n as f64 / 1_000.0)
+        format!("{:.1}K", n as f64 / 1_000.0)
     } else {
-        format!("{} tokens", n)
+        format!("{}", n)
     }
 }
 

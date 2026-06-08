@@ -55,18 +55,13 @@ async fn run_app(
     loop {
         terminal.draw(|f| ui::render(f, app))?;
 
-        if event::poll(std::time::Duration::from_millis(100))? {
+        if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                match (key.code, key.modifiers) {
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        app.quit();
-                    }
-                    (KeyCode::Char('q'), KeyModifiers::NONE) if app.is_idle() => {
-                        app.quit();
-                    }
-                    _ => {
-                        app.handle_key(key);
-                    }
+                // Only Ctrl+C quits globally
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    app.quit();
+                } else {
+                    app.handle_key(key);
                 }
             }
         }

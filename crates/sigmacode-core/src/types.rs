@@ -271,6 +271,11 @@ pub enum AgentEvent {
     Verified { success: bool },
     Error { message: String },
     Done { summary: String },
+    PermissionRequest { tool_name: String, description: String, args_summary: String },
+    PermissionResponse { allowed: bool, always: bool },
+    DiffGenerated { file_path: String, old_content: String, new_content: String },
+    Thinking { content: String },
+    Compacting { message: String },
 }
 
 // ── Provider Config ──

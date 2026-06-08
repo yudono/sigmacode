@@ -6,41 +6,37 @@ use crate::app::{App, AppState, MessageRole, Tab};
 const BRAND: Color = Color::Rgb(200, 160, 80);
 const DIM: Color = Color::Rgb(100, 100, 100);
 const ACCENT: Color = Color::Rgb(130, 180, 255);
-const SIDEBAR_BG: Color = Color::Rgb(25, 25, 30);
-const INPUT_BG: Color = Color::Rgb(30, 30, 38);
+const GREEN: Color = Color::Rgb(80, 200, 120);
+const RED: Color = Color::Rgb(230, 80, 80);
+const SIDEBAR_BG: Color = Color::Rgb(20, 20, 25);
 
 pub fn render(f: &mut Frame, app: &App) {
     let area = f.area();
 
-    // Main layout: content + sidebar
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Min(0),      // Content area
-            Constraint::Length(28),  // Sidebar
+            Constraint::Min(0),
+            Constraint::Length(26),
         ])
         .split(area);
 
-    // Content area: messages + input + status
     let content_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),   // Messages
-            Constraint::Length(3), // Input
-            Constraint::Length(1), // Status bar
+            Constraint::Min(1),
+            Constraint::Length(5), // input + model info
+            Constraint::Length(1),
         ])
         .split(main_chunks[0]);
 
-    // Render content
     match app.current_tab {
         Tab::Chat => render_chat(f, app, content_chunks[0]),
         Tab::Logs => render_logs(f, app, content_chunks[0]),
     }
 
-    render_input(f, app, content_chunks[1]);
+    render_input_area(f, app, content_chunks[1]);
     render_status_bar(f, app, content_chunks[2]);
-
-    // Render sidebar
     render_sidebar(f, app, main_chunks[1]);
 }
 
@@ -52,10 +48,7 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
             MessageRole::User => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        " > ",
-                        Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(" > ", Style::default().fg(BRAND).add_modifier(Modifier::BOLD)),
                     Span::styled(
                         msg.content.clone(),
                         Style::default()
@@ -72,40 +65,108 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
                     )));
                 }
             }
+            MessageRole::Tool => {
+                lines.push(Line::from(vec![
+                    Span::styled("   ", Style::default()),
+                    Span::styled("◆ ", Style::default().fg(ACCENT)),
+                    Span::styled(msg.content.clone(), Style::default().fg(DIM)),
+                ]));
+            }
+            MessageRole::Thought => {
+                lines.push(Line::from(vec![
+                    Span::styled("   ", Style::default()),
+                    Span::styled(
+                        msg.content.clone(),
+                        Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+            MessageRole::Diff => {
+                if let Some(ref diff) = msg.diff {
+                    lines.push(Line::from(vec![
+                        Span::styled("   ", Style::default()),
+                        Span::styled(
+                            format!("← Edit {}", diff.file_path),
+                            Style::default().fg(ACCENT),
+                        ),
+                    ]));
+                    // Show side-by-side diff
+                    let max_lines = diff.old_lines.len().max(diff.new_lines.len());
+                    for i in 0..max_lines.min(12) {
+                        let old = diff.old_lines.get(i);
+                        let new = diff.new_lines.get(i);
+
+                        let left = match old {
+                            Some(l) => {
+                                if l.is_removed {
+                                    Span::styled(
+                                        format!("- {}", l.content),
+                                        Style::default().fg(RED),
+                                    )
+                                } else {
+                                    Span::styled(
+                                        format!("  {}", l.content),
+                                        Style::default().fg(DIM),
+                                    )
+                                }
+                            }
+                            None => Span::styled("  ", Style::default()),
+                        };
+
+                        let right = match new {
+                            Some(l) => {
+                                if l.is_added {
+                                    Span::styled(
+                                        format!("+ {}", l.content),
+                                        Style::default().fg(GREEN),
+                                    )
+                                } else {
+                                    Span::styled(
+                                        format!("  {}", l.content),
+                                        Style::default().fg(DIM),
+                                    )
+                                }
+                            }
+                            None => Span::styled("  ", Style::default()),
+                        };
+
+                        lines.push(Line::from(vec![
+                            Span::styled("   ", Style::default()),
+                            left,
+                            Span::styled(" │ ", Style::default().fg(DIM)),
+                            right,
+                        ]));
+                    }
+                    if max_lines > 12 {
+                        lines.push(Line::from(vec![
+                            Span::styled("   ", Style::default()),
+                            Span::styled(
+                                format!("   ... {} more lines", max_lines - 12),
+                                Style::default().fg(DIM),
+                            ),
+                        ]));
+                    }
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled("   ", Style::default()),
+                        Span::styled(msg.content.clone(), Style::default().fg(ACCENT)),
+                    ]));
+                }
+            }
             MessageRole::System => {
                 let preview: String = msg.content.chars().take(100).collect();
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        "   ",
-                        Style::default(),
-                    ),
+                    Span::styled("   ", Style::default()),
                     Span::styled(
                         preview,
                         Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
                     ),
                 ]));
             }
-            MessageRole::Tool => {
-                let icon = "◆";
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "   ",
-                        Style::default(),
-                    ),
-                    Span::styled(
-                        format!("{} ", icon),
-                        Style::default().fg(ACCENT),
-                    ),
-                    Span::styled(
-                        msg.content.clone(),
-                        Style::default().fg(DIM),
-                    ),
-                ]));
-            }
         }
     }
 
-    // Running indicator
+    // Running spinner
     if app.state == AppState::Running {
         let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = spinner[app.tick_count % spinner.len()];
@@ -113,12 +174,9 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("   {} ", frame),
-                Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
+                Style::default().fg(BRAND),
             ),
-            Span::styled(
-                "thinking...".to_string(),
-                Style::default().fg(DIM),
-            ),
+            Span::styled("thinking...", Style::default().fg(DIM)),
         ]));
     }
 
@@ -128,74 +186,109 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_logs(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
-
     for log in app.logs.iter().rev().take(area.height as usize) {
         lines.push(Line::from(Span::styled(
             log.clone(),
             Style::default().fg(DIM),
         )));
     }
-
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_input(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if app.state == AppState::Input {
-            BRAND
-        } else {
-            DIM
-        }))
-        .style(Style::default().bg(INPUT_BG));
+fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Input box
+            Constraint::Length(1), // Model info
+        ])
+        .split(area);
+
+    // Input box
+    let border_color = match app.state {
+        AppState::Input => BRAND,
+        AppState::Permission => RED,
+        _ => DIM,
+    };
 
     let input_content = match app.state {
         AppState::Input => {
             let cursor = if app.tick_count % 20 < 10 { "▏" } else { " " };
             format!("{}{}", app.input, cursor)
         }
+        AppState::Permission => {
+            if let Some(ref req) = app.permission_pending {
+                format!(
+                    "Allow {}? (y=allow once, a=allow always, n=reject)",
+                    req.tool_name
+                )
+            } else {
+                String::new()
+            }
+        }
         AppState::Running => "...".to_string(),
         _ => String::new(),
     };
 
-    let input_style = if app.state == AppState::Input {
-        Style::default().fg(Color::White)
-    } else {
-        Style::default().fg(DIM)
-    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .bg(Color::Rgb(25, 25, 30));
 
-    let paragraph = Paragraph::new(input_content).style(input_style).block(block);
-    f.render_widget(paragraph, area);
+    let input = Paragraph::new(input_content)
+        .style(Style::default().fg(Color::White))
+        .block(block);
+    f.render_widget(input, chunks[0]);
+
+    // Model info line
+    let model_info = Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            "sigmaCode",
+            Style::default().fg(BRAND).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(DIM)),
+        Span::styled(&app.config.model, Style::default().fg(DIM)),
+        Span::styled(" · ", Style::default().fg(DIM)),
+        Span::styled(&app.token_display, Style::default().fg(DIM)),
+        Span::styled(
+            format!(" ({}%)", app.context_usage_pct),
+            Style::default().fg(DIM),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(model_info), chunks[1]);
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(30),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(40)])
         .split(area);
 
-    // Left: status
     let status = match app.state {
-        AppState::Idle => "esc interrupt",
-        AppState::Input => "enter send · esc cancel",
-        AppState::Running => "esc interrupt",
-        AppState::Done => "i new task · q quit",
+        AppState::Idle => " ctrl+c exit",
+        AppState::Input => " enter send · esc cancel",
+        AppState::Running => " ctrl+c interrupt",
+        AppState::Done => " i new task",
+        AppState::Permission => " y allow · a always · n reject",
     };
 
     f.render_widget(
-        Paragraph::new(format!(" {}", status)).style(Style::default().fg(DIM)),
+        Paragraph::new(status).style(Style::default().fg(DIM)),
         chunks[0],
     );
 
-    // Right: token count
-    let token_text = format!("{} ", app.token_usage);
-    f.render_widget(
-        Paragraph::new(token_text).style(Style::default().fg(DIM)),
-        chunks[1],
-    );
+    let right = Line::from(vec![
+        Span::styled(
+            format!("{} ", app.token_display),
+            Style::default().fg(DIM),
+        ),
+        Span::styled(
+            format!("${:.2}", app.cost),
+            Style::default().fg(DIM),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(right), chunks[1]);
 }
 
 fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
@@ -206,15 +299,15 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Length(5),  // Context info
-            Constraint::Length(2),  // LSP
-            Constraint::Min(0),    // Getting started
-            Constraint::Length(3), // Path
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(4),
         ])
         .split(inner);
 
-    // Title
+    // Context header
     let title = Paragraph::new(vec![
         Line::from(Span::styled(
             " Context",
@@ -230,21 +323,15 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
     ]);
     f.render_widget(title, chunks[0]);
 
-    // Context info
-    let ctx_info = Paragraph::new(vec![
+    // Token info
+    let ctx = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(
-                "Context",
-                Style::default().fg(Color::White),
-            ),
+            Span::styled("Context", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(
-                &app.token_display,
-                Style::default().fg(DIM),
-            ),
+            Span::styled(&app.token_display, Style::default().fg(DIM)),
         ]),
         Line::from(vec![
             Span::styled("  ", Style::default()),
@@ -261,7 +348,7 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]),
     ]);
-    f.render_widget(ctx_info, chunks[1]);
+    f.render_widget(ctx, chunks[1]);
 
     // LSP
     let lsp = Paragraph::new(vec![
@@ -279,7 +366,7 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(lsp, chunks[2]);
 
     // Getting started
-    let getting_started = Paragraph::new(vec![
+    let gs = Paragraph::new(vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  ", Style::default()),
@@ -294,41 +381,19 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("  ", Style::default()),
             Span::styled(
-                "SigmaCode includes free models",
+                "Press i to start typing",
                 Style::default().fg(DIM),
             ),
         ]),
         Line::from(vec![
             Span::styled("  ", Style::default()),
             Span::styled(
-                "so you can start immediately.",
-                Style::default().fg(DIM),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "Connect from 75+ providers to",
-                Style::default().fg(DIM),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "use other models, including",
-                Style::default().fg(DIM),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "Claude, GPT, Gemini etc",
+                "a task for SigmaCode",
                 Style::default().fg(DIM),
             ),
         ]),
     ]);
-    f.render_widget(getting_started, chunks[3]);
+    f.render_widget(gs, chunks[3]);
 
     // Path
     let cwd = std::env::current_dir()
@@ -340,8 +405,8 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_else(|_| "~".into());
 
-    let short_path: String = if cwd.len() > 24 {
-        format!("...{}", &cwd[cwd.len() - 21..])
+    let short_path: String = if cwd.len() > 22 {
+        format!("...{}", &cwd[cwd.len() - 19..])
     } else {
         cwd
     };
