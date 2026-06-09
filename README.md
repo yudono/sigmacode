@@ -63,6 +63,92 @@ sigmacode
 sigmacode-headless "Add Google OAuth to the app"
 ```
 
+**Server mode** (HTTP API):
+```bash
+# Start the server on default port 3847
+sigmacode-server
+
+# Or configure via environment
+SIGMACODE_PORT=3847 \
+SIGMACODE_API_KEY=your-key \
+SIGMACODE_BASE_URL=https://api.openai.com/v1 \
+SIGMACODE_MODEL=gpt-4o \
+sigmacode-server
+```
+
+The server exposes:
+- `GET /health` — health check
+- `POST /api/chat` — non-streaming chat
+- `POST /api/chat/stream` — SSE streaming chat
+- `GET /api/sessions` — list sessions
+- `POST /api/sessions` — create session
+- `GET /api/sessions/:id` — get session
+- `DELETE /api/sessions/:id` — delete session
+- `POST /api/sessions/:id/messages` — add message to session
+- `GET /config` — provider info
+
+### Server Security
+
+Protect API routes with a server key:
+
+```bash
+# Store key in Redis (encrypted with AES-256-GCM)
+cargo run --bin sigmacode-keys -- store "my-secret-key"
+
+# Or use env var directly
+SERVER_KEY=my-secret-key sigmacode-server
+```
+
+When `SERVER_KEY` is set, all `/api/*` requests must include:
+```
+Authorization: Bearer <server-key>
+```
+
+### Server with Redis (encrypted key storage)
+
+```bash
+REDIS_URL=redis://127.0.0.1:6379 \
+ENCRYPTION_KEY=02163eb0a4d05fd3265610aa4b6df4812be1d9a8510b7badea13bb625df5496d \
+SERVER_KEY=my-secret-key \
+sigmacode-server
+```
+
+The key is encrypted before storing in Redis and decrypted at startup.
+
+### API Examples
+
+**Chat (non-streaming):**
+```bash
+curl -X POST http://localhost:3847/api/chat \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret-key" \
+  -d '{"message": "Create a React todo app", "mode": "builder"}'
+```
+
+**Stream (SSE):**
+```bash
+curl -N -X POST http://localhost:3847/api/chat/stream \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret-key" \
+  -d '{"message": "List files in src/", "mode": "chat"}'
+```
+
+**Create session:**
+```bash
+curl -X POST http://localhost:3847/api/sessions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret-key" \
+  -d '{"title": "Build API", "mode": "builder"}'
+```
+
+### Execution Modes
+
+| Mode | Description |
+|------|-------------|
+| `chat` | Direct LLM, no tools — fast for questions and simple tasks |
+| `planner` | Analyze + plan only — shows decomposition without executing |
+| `builder` | Full orchestrator pipeline — plan, execute, verify, review |
+
 ## Configuration
 
 ### Environment Variables
@@ -73,6 +159,10 @@ sigmacode-headless "Add Google OAuth to the app"
 | `SIGMACODE_MODEL` | `gpt-4o` | Model to use |
 | `SIGMACODE_BASE_URL` | `https://api.openai.com/v1` | API base URL |
 | `SIGMACODE_PROVIDER` | `openai` | Provider: `openai`, `anthropic`, `gemini`, `ollama` |
+| `SIGMACODE_PORT` | `3847` | Server port (server mode only) |
+| `SERVER_KEY` | — | Auth key for API routes (server mode only) |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | Redis for encrypted key storage |
+| `ENCRYPTION_KEY` | — | Master key for AES-256-GCM key encryption |
 
 ### Provider Examples
 
@@ -164,9 +254,14 @@ sigmacode/
 ├── crates/
 │   ├── sigmacode-core/       # Core agent engine
 │   ├── sigmacode-tui/        # Terminal UI
-│   ├── sigmacode-cli/        # Headless CLI
+│   ├── sigmacode-cli/        # Headless CLI, HTTP server, key manager
 │   ├── sigmacode-retrieval/  # Context retrieval (WIP)
 │   └── sigmacode-sandbox/    # OS sandboxing (WIP)
+├── target/release/
+│   ├── sigmacode             # TUI binary
+│   ├── sigmacode-headless    # Headless CLI
+│   ├── sigmacode-server      # HTTP API server
+│   └── sigmacode-keys        # Key encryption tool
 └── .env                      # Your config (git-ignored)
 ```
 

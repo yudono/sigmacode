@@ -39,6 +39,9 @@ syntect = { version = "5", features = ["default-fancy"], default-features = fals
 graph-flow = { version = "0.5", features = ["rig"] }
 rig-core = "0.38"
 log = "0.4"
+fred = "9"
+aes-gcm = "0.10"
+hex = "0.4"
 
 sigmacode-core = { path = "crates/sigmacode-core" }
 sigmacode-retrieval = { path = "crates/sigmacode-retrieval" }

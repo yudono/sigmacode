@@ -24,6 +24,9 @@ regex = "1"
 tokio-util = { version = "0.7", features = ["rt"] }
 graph-flow.workspace = true
 rig-core.workspace = true
+fred.workspace = true
+aes-gcm.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

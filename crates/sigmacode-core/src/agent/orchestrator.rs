@@ -16,7 +16,7 @@ const MAX_REPLAN_ATTEMPTS: u32 = 3;
 
 #[allow(dead_code)]
 pub struct Orchestrator {
-    analyzer: Analyzer,
+    pub analyzer: Analyzer,
     verifier: Verifier,
     critic: Critic,
     reviewer: Reviewer,
@@ -173,7 +173,7 @@ impl Orchestrator {
         }
     }
 
-    async fn create_plan(
+    pub async fn create_plan(
         &self,
         request: &str,
         analysis: &crate::types::TaskAnalysis,

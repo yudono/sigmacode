@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod context;
 pub mod error;
+pub mod key_store;
 pub mod llm;
 pub mod rate_limit;
 pub mod security;

@@ -1,5 +1,6 @@
 use futures::StreamExt;
 use std::sync::Arc;
+use std::pin::pin;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -440,6 +441,119 @@ impl Agent {
     }
 
     pub async fn run(
+        &self,
+        state: &mut AgentState,
+        cancel: CancellationToken,
+        event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<String> {
+        let mode = AgentMode::Builder;
+        self.run_with_mode(state, cancel, event_tx, &mode).await
+    }
+
+    pub async fn run_with_mode(
+        &self,
+        state: &mut AgentState,
+        cancel: CancellationToken,
+        event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+        mode: &AgentMode,
+    ) -> Result<String> {
+        match mode {
+            AgentMode::Chat => self.run_chat(state, cancel, event_tx).await,
+            AgentMode::Planner => self.run_planner(state, cancel, event_tx).await,
+            AgentMode::Builder => self.run_builder(state, cancel, event_tx).await,
+        }
+    }
+
+    async fn run_chat(
+        &self,
+        state: &mut AgentState,
+        cancel: CancellationToken,
+        event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<String> {
+        let send_event = |event: AgentEvent| {
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(event);
+            }
+        };
+
+        let prompt = self.context_builder.build_chat_prompt();
+
+        let mut messages: Vec<crate::types::Message> = Vec::new();
+        messages.push(crate::types::Message::System {
+            content: prompt,
+        });
+        messages.push(crate::types::Message::User {
+            content: state.task.clone(),
+        });
+
+        let options = crate::types::CompletionOptions {
+            max_tokens: Some(state.config.max_tokens),
+            temperature: Some(state.config.temperature),
+            tool_choice: None,
+        };
+
+        let mut response = String::new();
+        let stream = self.provider.complete_stream(&messages, &[], &options).await?;
+        let mut stream = pin!(stream);
+
+        while let Some(event) = stream.next().await {
+            if cancel.is_cancelled() {
+                return Err(SigmaError::Cancelled);
+            }
+            match event {
+                Ok(crate::types::LlmEvent::ContentDelta(token)) => {
+                    response.push_str(&token);
+                    send_event(AgentEvent::Streaming { token });
+                }
+                Ok(crate::types::LlmEvent::Done { .. }) => {}
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        send_event(AgentEvent::Done { summary: response.clone() });
+        Ok(response)
+    }
+
+    async fn run_planner(
+        &self,
+        state: &mut AgentState,
+        _cancel: CancellationToken,
+        event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+    ) -> Result<String> {
+        let send_event = |event: AgentEvent| {
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(event);
+            }
+        };
+
+        send_event(AgentEvent::Planning { goal: state.task.clone() });
+
+        let request = state.task.clone();
+        let orchestrator = Orchestrator::new(
+            self.provider.clone(),
+            self.tools.clone(),
+            state.workspace.clone(),
+        );
+
+        // Run analysis only
+        let analysis = orchestrator.analyzer.analyze(&request, state).await?;
+        send_event(AgentEvent::AnalysisComplete {
+            goals: analysis.goals.clone(),
+            constraints: analysis.constraints.clone(),
+            success_criteria: analysis.success_criteria.clone(),
+        });
+
+        // Create plan only (no execution)
+        let plan_text = orchestrator.create_plan(&request, &analysis).await?;
+
+        send_event(AgentEvent::Done { summary: plan_text.clone() });
+        Ok(plan_text)
+    }
+
+    async fn run_builder(
         &self,
         state: &mut AgentState,
         cancel: CancellationToken,

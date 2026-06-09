@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use serde::{Deserialize, Serialize};
 use sigmacode_core::llm::create_provider;
 use sigmacode_core::tools::ToolRouter;
@@ -428,6 +429,27 @@ impl App {
             .filter(|c| c.name[1..].contains(query))
             .collect();
         self.cmd_selected = 0;
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if self.scroll_offset > 0 {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                    self.follow = false;
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Click to enter input mode if in idle/done state
+                if self.state == AppState::Idle || self.state == AppState::Done {
+                    self.state = AppState::Input;
+                }
+            }
+            _ => {}
+        }
     }
 
     // ── Setup Wizard ──

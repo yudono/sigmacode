@@ -20,13 +20,16 @@ fn syntect_to_color(c: syntect::highlighting::Color) -> ratatui::style::Color {
     Color::Rgb(c.r, c.g, c.b)
 }
 
-pub fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
+fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
     let ss = syntax_set();
     let ts = theme_set();
 
-    let syntax = ss
-        .find_syntax_by_token(lang)
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let syntax = if lang.is_empty() {
+        ss.find_syntax_plain_text()
+    } else {
+        ss.find_syntax_by_token(lang)
+            .unwrap_or_else(|| ss.find_syntax_plain_text())
+    };
 
     let theme = &ts.themes["base16-ocean.dark"];
     let mut h = HighlightLines::new(syntax, theme);
@@ -43,30 +46,21 @@ pub fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
                     )
                 })
                 .collect();
-            Line::from(spans)
+            if spans.is_empty() {
+                Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Rgb(200, 200, 200)),
+                ))
+            } else {
+                Line::from(spans)
+            }
         })
         .collect()
-}
-
-fn looks_like_jsx(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() { return false; }
-    if trimmed.starts_with('<') && !trimmed.starts_with("<!--") { return true; }
-    if trimmed.starts_with('{') && trimmed.contains('}') { return true; }
-    if trimmed.contains("className=") || trimmed.contains("onClick=") { return true; }
-    if trimmed.contains("viewBox=") || trimmed.contains("fill=\"") { return true; }
-    if trimmed.contains("import ") && trimmed.contains("from ") { return true; }
-    if trimmed.contains("export ") && (trimmed.contains("function ") || trimmed.contains("default ")) { return true; }
-    if trimmed.starts_with("const ") || trimmed.starts_with("let ") || trimmed.starts_with("function ") { return true; }
-    if trimmed.starts_with("return (") || trimmed.starts_with("return(") { return true; }
-    if trimmed.contains("useState") || trimmed.contains("useEffect") { return true; }
-    false
 }
 
 pub fn render_message_with_highlights(content: &str) -> Vec<Line<'static>> {
     let mut result = Vec::new();
     let mut in_code_block = false;
-    let mut in_auto_code = false;
     let mut lang = String::new();
     let mut code_lines = Vec::new();
 
@@ -76,29 +70,20 @@ pub fn render_message_with_highlights(content: &str) -> Vec<Line<'static>> {
     for line in normalized.lines() {
         if line.starts_with("```") {
             if in_code_block {
+                // End of fenced code block — highlight it
                 let highlighted = highlight_code_block(&code_lines.join("\n"), &lang);
                 result.extend(highlighted);
                 code_lines.clear();
                 in_code_block = false;
             } else {
-                lang = line.trim_start_matches('`').trim().to_string();
+                // Start of fenced code block — extract language token
+                lang = line[3..].trim().to_string();
                 in_code_block = true;
             }
         } else if in_code_block {
             code_lines.push(line);
-        } else if looks_like_jsx(line) {
-            if !in_auto_code {
-                in_auto_code = true;
-                code_lines.clear();
-            }
-            code_lines.push(line);
         } else {
-            if in_auto_code && !code_lines.is_empty() {
-                let highlighted = highlight_code_block(&code_lines.join("\n"), "jsx");
-                result.extend(highlighted);
-                code_lines.clear();
-                in_auto_code = false;
-            }
+            // Regular text — render as-is with default color
             result.push(Line::from(Span::styled(
                 line.to_string(),
                 Style::default().fg(Color::Rgb(200, 200, 200)),
@@ -106,12 +91,9 @@ pub fn render_message_with_highlights(content: &str) -> Vec<Line<'static>> {
         }
     }
 
+    // Flush remaining code block
     if in_code_block && !code_lines.is_empty() {
         let highlighted = highlight_code_block(&code_lines.join("\n"), &lang);
-        result.extend(highlighted);
-    }
-    if in_auto_code && !code_lines.is_empty() {
-        let highlighted = highlight_code_block(&code_lines.join("\n"), "jsx");
         result.extend(highlighted);
     }
 

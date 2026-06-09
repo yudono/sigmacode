@@ -1,4 +1,4 @@
-use crate::types::{AgentState, ToolDefinition};
+use crate::types::{AgentMode, AgentState, ToolDefinition};
 
 pub struct ContextBuilder {
     project_name: String,
@@ -26,6 +26,86 @@ impl ContextBuilder {
     }
 
     pub fn build_system_prompt(&self, state: &AgentState) -> String {
+        self.build_prompt_for_mode(&AgentMode::Builder, state)
+    }
+
+    pub fn build_prompt_for_mode(&self, mode: &AgentMode, state: &AgentState) -> String {
+        match mode {
+            AgentMode::Chat => self.build_chat_prompt(),
+            AgentMode::Planner => self.build_planner_prompt(state),
+            AgentMode::Builder => self.build_builder_prompt(state),
+        }
+    }
+
+    pub fn build_chat_prompt(&self) -> String {
+        format!(
+            r#"You are SigmaCode, a helpful AI assistant.
+
+## Project: {}
+
+Answer questions concisely and helpfully. You are in **Chat mode** — no tools, no file operations, just conversation.
+
+Rules:
+- Be concise and direct
+- Use markdown formatting when helpful
+- If the user asks for code changes, suggest switching to Builder mode
+- If the user asks for a plan, suggest switching to Planner mode"#,
+            self.project_name
+        )
+    }
+
+    fn build_planner_prompt(&self, state: &AgentState) -> String {
+        let tool_list: Vec<String> = self.tools
+            .iter()
+            .map(|t| {
+                let params = serde_json::to_string_pretty(&t.parameters).unwrap_or_default();
+                format!("- {}: {}\n  Parameters: {}", t.name, t.description, params)
+            })
+            .collect();
+
+        let tools_section = if !self.tools.is_empty() {
+            format!(
+                "\n## Available Tools\n\n{}\n\nThese are the tools available for execution. Use them to inform your plan.",
+                tool_list.join("\n\n")
+            )
+        } else {
+            String::new()
+        };
+
+        let mut prompt = format!(
+            r#"You are SigmaCode, an expert AI coding assistant in **Planner mode**.
+
+Your job is to analyze the user's request and produce a clear, step-by-step plan. Do NOT execute anything — just plan.
+
+## Project: {}
+
+## Rules:
+1. Analyze the request thoroughly
+2. Identify what files need to be created, modified, or read
+3. Detect the project framework (React/Next.js/Vue/Rust/Python/etc.)
+4. Check existing dependencies before planning installs
+5. Produce a numbered plan with clear steps
+6. Estimate complexity and risk
+
+## Output Format:
+Provide your plan as a numbered list. Each step should be specific and actionable.
+Include which tools would be used for each step.
+
+## Workspace: {}{}
+"#,
+            self.project_name,
+            state.workspace.display(),
+            tools_section,
+        );
+
+        if let Some(ref instructions) = self.custom_instructions {
+            prompt.push_str(&format!("\n## Additional Instructions\n{}\n", instructions));
+        }
+
+        prompt
+    }
+
+    fn build_builder_prompt(&self, state: &AgentState) -> String {
         let tool_list: Vec<String> = self.tools
             .iter()
             .map(|t| {
@@ -62,8 +142,6 @@ You have access to tools for reading, writing, and editing files, running shell 
    - If "react" is in dependencies and "next" is NOT → it's a plain React project
    - If "vue" is in dependencies → it's a Vue project
    - Use ONLY commands appropriate for the detected framework
-   - Do NOT use `npx shadcn@latest init` in a plain React project (shadcn is Next.js-focused)
-   - Do NOT use `next dev`, `next build` in a non-Next.js project
 3. Never reinstall dependencies that already exist
 4. Make minimal, targeted changes - never rewrite entire files unnecessarily
 5. After making changes, verify with build/test commands when appropriate
@@ -90,7 +168,6 @@ You have access to tools for reading, writing, and editing files, running shell 
 - Dev: `npm run dev`
 - Build: `npm run build`
 - Add packages: `npm install <package>`
-- Do NOT use shadcn init (Next.js only)
 
 ### Next.js — when package.json has "next":
 - Scaffold: `npx create-next-app@latest`
@@ -107,11 +184,9 @@ You have access to tools for reading, writing, and editing files, running shell 
 ## Tooling Preferences:
 - NEVER use create-react-app (CRA) — it is deprecated and slow
 - For React/Vue/Svelte/TS projects, use `bun create vite` or `npm create vite@latest`
-- For package management, prefer `bun` over `npm` when available (faster installs)
-- For new Node.js projects, prefer `bun init` over `npm init`
+- For package management, prefer `bun` over `npm` when available
 - When scaffolding, always use the latest modern tools (Vite, Turbopack, esbuild)
-- If user explicitly asks for CRA, warn them and suggest Vite instead
-- ALWAYS use `-y` flag with npx (e.g. `npx -y create-vite`) to auto-confirm package installs — without it, npx hangs waiting for user input{}
+- ALWAYS use `-y` flag with npx to auto-confirm package installs{}
 "#,
             self.project_name, tools_section
         );

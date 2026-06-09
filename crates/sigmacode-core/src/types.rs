@@ -2,6 +2,44 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+// ── Agent Mode ──
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    Chat,
+    Planner,
+    Builder,
+}
+
+impl Default for AgentMode {
+    fn default() -> Self {
+        Self::Chat
+    }
+}
+
+impl std::fmt::Display for AgentMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Chat => write!(f, "chat"),
+            Self::Planner => write!(f, "planner"),
+            Self::Builder => write!(f, "builder"),
+        }
+    }
+}
+
+impl std::str::FromStr for AgentMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "chat" => Ok(Self::Chat),
+            "planner" => Ok(Self::Planner),
+            "builder" => Ok(Self::Builder),
+            _ => Err(format!("Unknown mode: {}", s)),
+        }
+    }
+}
+
 // ── Agent State ──
 
 #[derive(Debug, Clone)]
@@ -259,7 +297,8 @@ pub enum LlmEvent {
 
 // ── Agent Events (for TUI) ──
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data")]
 pub enum AgentEvent {
     Planning { goal: String },
     PlanCreated { tasks: Vec<Task> },
@@ -399,4 +438,23 @@ pub struct SessionMemory {
     pub files_modified: Vec<String>,
     pub errors_encountered: Vec<String>,
     pub patterns_learned: Vec<String>,
+}
+
+// ── Session Persistence ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub title: String,
+    pub mode: AgentMode,
+    pub created_at: String,
+    pub updated_at: String,
+    pub messages: Vec<SessionMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMessage {
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
 }

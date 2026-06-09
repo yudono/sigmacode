@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "sigmacode-server"
 path = "src/server.rs"
 
+[[bin]]
+name = "sigmacode-keys"
+path = "src/keys.rs"
+
 [dependencies]
 sigmacode-core.workspace = true
 tokio.workspace = true
@@ -30,3 +34,5 @@ serde.workspace = true
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 tower = "0.4"
+async-stream = "0.3"
+chrono = "0.4"
